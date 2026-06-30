@@ -21,18 +21,67 @@ Two laptops face screen-to-camera. Data is encoded as high-density colored 2D gr
 
 ## Installation
 
-### Native build
+### Download prebuilt binaries
+
+Prebuilt binaries for Linux and Windows are in the [releases](../../releases).
+
+| Platform | File |
+|----------|------|
+| Linux (x86_64) | `air-transfer-v0.1.0-linux-x86_64.tar.gz` |
+| Windows (x86_64) | `air-transfer-v0.1.0-windows-x86_64.zip` |
+
+Extract and run:
+```bash
+# Linux
+tar xzf air-transfer-v0.1.0-linux-x86_64.tar.gz
+./air-transfer --help
+
+# Windows
+# Extract the zip and run air-transfer.exe from Command Prompt or PowerShell
+air-transfer.exe --help
+```
+
+### Build from source
+
+**Prerequisites per platform:**
+
+| Platform | Toolchain |
+|----------|-----------|
+| Linux | `build-essential pkg-config libv4l-dev` (Debian) or `base-devel v4l-utils` (Arch) |
+| macOS | `xcode-select --install` |
+| Windows | [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) or `mingw-w64` |
 
 ```bash
-# Prerequisites
-# Linux:   sudo apt install build-essential pkg-config libv4l-dev
-# macOS:   xcode-select --install
-# Windows: install Visual Studio Build Tools
-
 git clone https://github.com/user/air-transfer.git
 cd air-transfer
 cargo build --release
 ```
+
+### Cross-compile for Windows from Linux
+
+Install the MinGW cross-compiler, then build:
+
+```bash
+# Arch
+sudo pacman -S mingw-w64-gcc
+
+# Debian/Ubuntu
+sudo apt install mingw-w64
+
+# Add Windows target
+rustup target add x86_64-pc-windows-gnu
+
+# Build
+cargo build --release --target x86_64-pc-windows-gnu
+```
+
+### Build all platforms at once
+
+```bash
+./scripts/build.sh
+```
+
+This produces release packages in `target/release-packages/` — ready to ship.
 
 ### Web build (WASM)
 
@@ -47,6 +96,34 @@ rustup target add wasm32-unknown-unknown
 trunk serve
 # Opens at http://localhost:8080
 ```
+
+---
+
+## Ship / distribute
+
+To create distributable archives for all supported platforms:
+
+```bash
+./scripts/build.sh
+```
+
+Output:
+```
+target/release-packages/
+├── air-transfer-v0.1.0-linux-x86_64.tar.gz      # Linux binary + README
+├── air-transfer-v0.1.0-windows-x86_64.zip       # Windows binary + README
+├── linux/                                        # intermediate staging
+└── windows/
+```
+
+Each archive contains:
+- `air-transfer` (or `air-transfer.exe`) — the binary
+- `README.md` — usage documentation
+- `LICENSE` — MIT
+
+**Windows note:** The `.exe` requires no runtime dependencies. Copy it to any Windows 10+ machine and run.
+
+**Linux note:** Binary links against `glibc` (standard on all desktop distros). For maximum portability, build on the oldest glibc you want to support.
 
 ---
 

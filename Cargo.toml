@@ -10,6 +10,13 @@ crate-type = ["cdylib", "rlib"]
 name = "air-transfer"
 path = "src/main.rs"
 
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
 [dependencies]
 # Core (shared across native + wasm)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
@@ -35,7 +42,6 @@ web-sys = { version = "0.3", features = [
     "HtmlCanvasElement",
     "HtmlVideoElement",
     "HtmlInputElement",
-    "HtmlAnchorElement",
     "HtmlElement",
     "ImageData",
     "MediaStream",
@@ -47,31 +53,17 @@ web-sys = { version = "0.3", features = [
     "Document",
     "Element",
     "Event",
-    "EventTarget",
     "File",
-    "FileList",
     "FileReader",
     "Blob",
     "BlobPropertyBag",
     "Url",
     "Response",
-    "Request",
-    "RequestInit",
-    "Headers",
     "console",
     "DomRect",
-    "DomException",
-    "MediaTrackConstraints",
-    "MediaTrackSupportedConstraints",
-    "VideoTrack",
-    "VideoTrackList",
-    "MessageEvent",
 ] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 gloo-timers = { version = "0.3", features = ["futures"] }
-gloo-file = "0.3"
-gloo-dialogs = "0.2"
-gloo-utils = { version = "0.2", features = ["serde"] }
 serde-wasm-bindgen = "0.6"
