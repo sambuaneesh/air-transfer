@@ -1,72 +1,71 @@
-import {
-  DEFAULT_CALIBRATION_PROFILE,
-  decodeControlPayload,
-  decodeFrame,
-  decodeManifestFrame,
-  encodeControlFrame,
-  prepareTransfer,
-  serializeFrame,
-  applyFrameToChunkState,
-  createChunkDecodeState,
-  type ChunkDecodeState,
-  type ControlFrame,
-  type FrameEnvelope,
-  type PreparedTransfer,
-  type TransferManifest
-} from "@airt2/protocol";
-import { scoreCalibration } from "@airt2/simulator";
-import { useEffect, useRef, useState } from "react";
+import { sha256Hex } from "@airt2/protocol";
+import jsQR from "jsqr";
+import QRCode from "qrcode";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { readVideoFrame, startCamera, stopCamera } from "./lib/camera";
-import { decodePacketFromImage, renderSignalCanvas } from "./lib/optical";
 import { compressPayload, materializePayload } from "./lib/payload";
+import {
+  applyShard,
+  assembleReceiverSession,
+  createReceiverSession,
+  parseQrPayload,
+  prepareQrTransfer,
+  type PreparedQrTransfer,
+  type QrManifest,
+  type ReceiverSession
+} from "./lib/qrTransport";
 
 type Mode = "sender" | "receiver";
-type SenderPhase = "idle" | "manifest" | "sending" | "paused" | "done";
-type ReceiverPhase = "idle" | "listening" | "receiving" | "complete";
 
-interface SenderRuntime {
-  prepared: PreparedTransfer;
-  currentChunkIndex: number;
-  frameCursor: number;
-  retransmits: number;
+const MANIFEST_EVERY = 5;
+const DEFAULT_FRAME_INTERVAL_MS = 900;
+const DEFAULT_SHARD_SIZE = 32;
+const MIN_FRAME_INTERVAL_MS = 50;
+const MAX_FRAME_INTERVAL_MS = 5000;
+const MIN_SHARD_SIZE = 8;
+const MAX_SHARD_SIZE = 512;
+
+interface SenderState {
+  prepared: PreparedQrTransfer;
+  startedAt: number;
+  tick: number;
+}
+
+interface ReceiverDiagnostics {
+  cameraReady: boolean;
+  permissionError: string | null;
+  framesSeen: number;
+  qrDetections: number;
+  manifestHits: number;
+  shardHits: number;
+  uniqueShards: number;
   duplicates: number;
-  lastControl: ControlFrame | null;
-  phase: SenderPhase;
-  startedAt: number;
-  activeFrame: FrameEnvelope | null;
-  calibrationScore: number;
+  lastKind: string;
+  guidance: string;
+  lastBounds: Bounds | null;
 }
 
-interface ReceiverRuntime {
-  manifest: TransferManifest | null;
-  currentChunkState: ChunkDecodeState | null;
-  chunks: Uint8Array[];
-  duplicateFrames: number;
-  phase: ReceiverPhase;
-  activeControl: FrameEnvelope | null;
-  calibrationScore: number;
-  downloadUrl: string | null;
-  receivedName: string | null;
-  error: string | null;
-  lastConfirmedChunk: number;
-  startedAt: number;
+interface Bounds {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
 }
 
-function emptyReceiverState(): ReceiverRuntime {
+function emptyDiagnostics(): ReceiverDiagnostics {
   return {
-    manifest: null,
-    currentChunkState: null,
-    chunks: [],
-    duplicateFrames: 0,
-    phase: "idle",
-    activeControl: null,
-    calibrationScore: 0,
-    downloadUrl: null,
-    receivedName: null,
-    error: null,
-    lastConfirmedChunk: -1,
-    startedAt: 0
+    cameraReady: false,
+    permissionError: null,
+    framesSeen: 0,
+    qrDetections: 0,
+    manifestHits: 0,
+    shardHits: 0,
+    uniqueShards: 0,
+    duplicates: 0,
+    lastKind: "none",
+    guidance: "Receiver idle.",
+    lastBounds: null
   };
 }
 
@@ -74,9 +73,11 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) {
     return `${bytes} B`;
   }
+
   if (bytes < 1024 * 1024) {
     return `${(bytes / 1024).toFixed(1)} KB`;
   }
+
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
@@ -84,47 +85,181 @@ function formatSeconds(ms: number): string {
   return `${Math.max(0, ms / 1000).toFixed(1)} s`;
 }
 
+function getCurrentFrameText(state: SenderState | null): string | null {
+  if (!state) {
+    return null;
+  }
+
+  if (state.tick % MANIFEST_EVERY === 0) {
+    return state.prepared.manifestText;
+  }
+
+  const shardIndex = Math.floor(state.tick / MANIFEST_EVERY) % state.prepared.shardTexts.length;
+  return state.prepared.shardTexts[shardIndex];
+}
+
+function getCurrentFrameLabel(state: SenderState | null): string {
+  if (!state) {
+    return "QR Broadcast Idle";
+  }
+
+  if (state.tick % MANIFEST_EVERY === 0) {
+    return "Manifest";
+  }
+
+  const shardIndex = Math.floor(state.tick / MANIFEST_EVERY) % state.prepared.shardTexts.length;
+  return `Shard ${shardIndex + 1} / ${state.prepared.manifest.totalShards}`;
+}
+
+async function renderQrStage(
+  canvas: HTMLCanvasElement,
+  text: string | null,
+  label: string
+): Promise<void> {
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return;
+  }
+
+  const width = canvas.width;
+  const height = canvas.height;
+  context.clearRect(0, 0, width, height);
+
+  const gradient = context.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, "#04060a");
+  gradient.addColorStop(1, "#0c131b");
+  context.fillStyle = gradient;
+  context.fillRect(0, 0, width, height);
+
+  const stageSize = Math.floor(Math.min(width, height) * 0.82);
+  const qrSize = Math.floor(stageSize * 0.78);
+  const qrX = Math.floor((width - qrSize) / 2);
+  const qrY = Math.floor((height - qrSize) / 2);
+
+  context.fillStyle = "#f7f9ff";
+  context.fillRect(
+    qrX - Math.floor(qrSize * 0.11),
+    qrY - Math.floor(qrSize * 0.11),
+    Math.floor(qrSize * 1.22),
+    Math.floor(qrSize * 1.22)
+  );
+
+  if (text) {
+    const offscreen = document.createElement("canvas");
+    await QRCode.toCanvas(offscreen, text, {
+      errorCorrectionLevel: "H",
+      margin: 2,
+      width: qrSize,
+      color: {
+        dark: "#05070c",
+        light: "#f7f9ff"
+      }
+    });
+    context.drawImage(offscreen, qrX, qrY, qrSize, qrSize);
+  } else {
+    context.fillStyle = "#05070c";
+    context.fillRect(qrX, qrY, qrSize, qrSize);
+  }
+
+  context.strokeStyle = "#68f0c1";
+  context.lineWidth = Math.max(4, stageSize * 0.008);
+  context.strokeRect(
+    qrX - Math.floor(qrSize * 0.11),
+    qrY - Math.floor(qrSize * 0.11),
+    Math.floor(qrSize * 1.22),
+    Math.floor(qrSize * 1.22)
+  );
+
+  context.fillStyle = "#f7f9ff";
+  context.font = `${Math.max(20, stageSize * 0.04)}px "IBM Plex Mono", monospace`;
+  context.fillText(label.toUpperCase(), Math.max(28, width * 0.06), height - Math.max(40, height * 0.07));
+
+  context.fillStyle = "#8ea2b8";
+  context.font = `${Math.max(14, stageSize * 0.022)}px "IBM Plex Mono", monospace`;
+  context.fillText(
+    "Large QR, low bitrate, infinite loop broadcast",
+    Math.max(28, width * 0.06),
+    Math.max(42, height * 0.08)
+  );
+}
+
+function qrBoundsFromLocation(
+  location: NonNullable<ReturnType<typeof jsQR>>["location"],
+  width: number,
+  height: number
+): Bounds {
+  const xs = [
+    location.topLeftCorner.x,
+    location.topRightCorner.x,
+    location.bottomLeftCorner.x,
+    location.bottomRightCorner.x
+  ];
+  const ys = [
+    location.topLeftCorner.y,
+    location.topRightCorner.y,
+    location.bottomLeftCorner.y,
+    location.bottomRightCorner.y
+  ];
+
+  const minX = Math.max(0, Math.min(...xs));
+  const maxX = Math.min(width, Math.max(...xs));
+  const minY = Math.max(0, Math.min(...ys));
+  const maxY = Math.min(height, Math.max(...ys));
+
+  return {
+    left: (minX / width) * 100,
+    top: (minY / height) * 100,
+    width: ((maxX - minX) / width) * 100,
+    height: ((maxY - minY) / height) * 100
+  };
+}
+
 function App() {
   const [mode, setMode] = useState<Mode>("sender");
-  const [message, setMessage] = useState("Transfer payloads optically across two laptop screens.");
+  const [message, setMessage] = useState("Air T2 QR broadcast payload");
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState("Point each laptop camera at the other screen, then calibrate before starting.");
-  const [senderRuntime, setSenderRuntime] = useState<SenderRuntime | null>(null);
-  const [receiverRuntime, setReceiverRuntime] = useState<ReceiverRuntime>(() => emptyReceiverState());
-  const [senderCameraEnabled, setSenderCameraEnabled] = useState(false);
-  const [receiverCameraEnabled, setReceiverCameraEnabled] = useState(false);
-  const [senderStageFullscreen, setSenderStageFullscreen] = useState(false);
-  const [receiverStageFullscreen, setReceiverStageFullscreen] = useState(false);
+  const [status, setStatus] = useState(
+    "This build uses an infinite-loop QR broadcast. Sender repeats manifest and shard QRs forever; receiver only needs to scan and accumulate."
+  );
+  const [frameIntervalMs, setFrameIntervalMs] = useState(DEFAULT_FRAME_INTERVAL_MS);
+  const [shardSize, setShardSize] = useState(DEFAULT_SHARD_SIZE);
+  const [senderState, setSenderState] = useState<SenderState | null>(null);
+  const [receiverDiagnostics, setReceiverDiagnostics] = useState<ReceiverDiagnostics>(() => emptyDiagnostics());
+  const [receiverEnabled, setReceiverEnabled] = useState(false);
+  const [receiverManifest, setReceiverManifest] = useState<QrManifest | null>(null);
+  const [receiverProgress, setReceiverProgress] = useState({ received: 0, total: 0, startedAt: 0 });
+  const [receiverDownloadUrl, setReceiverDownloadUrl] = useState<string | null>(null);
+  const [receiverDownloadName, setReceiverDownloadName] = useState<string | null>(null);
+  const [receiverError, setReceiverError] = useState<string | null>(null);
+  const [senderFullscreen, setSenderFullscreen] = useState(false);
 
-  const senderVideoRef = useRef<HTMLVideoElement | null>(null);
-  const receiverVideoRef = useRef<HTMLVideoElement | null>(null);
   const senderCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const receiverCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const senderCaptureCanvasRef = useRef<HTMLCanvasElement>(document.createElement("canvas"));
+  const senderLabRef = useRef<HTMLDivElement | null>(null);
+  const receiverVideoRef = useRef<HTMLVideoElement | null>(null);
   const receiverCaptureCanvasRef = useRef<HTMLCanvasElement>(document.createElement("canvas"));
-  const senderStreamRef = useRef<MediaStream | null>(null);
   const receiverStreamRef = useRef<MediaStream | null>(null);
+  const receiverLabRef = useRef<HTMLDivElement | null>(null);
+  const receiverSessionRef = useRef<ReceiverSession | null>(null);
 
-  const senderRuntimeRef = useRef<SenderRuntime | null>(null);
-  const receiverRuntimeRef = useRef<ReceiverRuntime>(receiverRuntime);
-
-  useEffect(() => {
-    senderRuntimeRef.current = senderRuntime;
-  }, [senderRuntime]);
-
-  useEffect(() => {
-    receiverRuntimeRef.current = receiverRuntime;
-  }, [receiverRuntime]);
+  const senderFrameText = useMemo(() => getCurrentFrameText(senderState), [senderState]);
+  const senderFrameLabel = useMemo(() => getCurrentFrameLabel(senderState), [senderState]);
 
   useEffect(() => {
     return () => {
-      stopCamera(senderStreamRef.current);
       stopCamera(receiverStreamRef.current);
-      const url = receiverRuntimeRef.current.downloadUrl;
-      if (url) {
-        URL.revokeObjectURL(url);
+      if (receiverDownloadUrl) {
+        URL.revokeObjectURL(receiverDownloadUrl);
       }
     };
+  }, [receiverDownloadUrl]);
+
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setSenderFullscreen(document.fullscreenElement === senderLabRef.current);
+    };
+
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
   useEffect(() => {
@@ -133,245 +268,74 @@ function App() {
       return;
     }
 
-    canvas.width = Math.floor(window.innerWidth * (senderStageFullscreen ? window.devicePixelRatio : 1.2));
-    canvas.height = Math.floor((senderStageFullscreen ? window.innerHeight : 560) * (senderStageFullscreen ? window.devicePixelRatio : 1.2));
-    const packet = senderRuntime?.activeFrame ? serializeFrame(senderRuntime.activeFrame) : null;
-    renderSignalCanvas(canvas, packet, "forward channel", "#68f0c1");
-  }, [senderRuntime?.activeFrame, senderStageFullscreen]);
+    const container = canvas.parentElement;
+    const bounds = container?.getBoundingClientRect();
+    canvas.width = Math.max(420, Math.floor((bounds?.width ?? 760) * window.devicePixelRatio));
+    canvas.height = Math.max(420, Math.floor((bounds?.height ?? 760) * window.devicePixelRatio));
 
-  useEffect(() => {
-    const canvas = receiverCanvasRef.current;
-    if (!canvas) {
-      return;
-    }
-
-    canvas.width = Math.floor(window.innerWidth * (receiverStageFullscreen ? window.devicePixelRatio : 1.2));
-    canvas.height = Math.floor((receiverStageFullscreen ? window.innerHeight : 560) * (receiverStageFullscreen ? window.devicePixelRatio : 1.2));
-    const packet = receiverRuntime.activeControl ? serializeFrame(receiverRuntime.activeControl) : null;
-    renderSignalCanvas(canvas, packet, "reverse control", "#ffd26f");
-  }, [receiverRuntime.activeControl, receiverStageFullscreen]);
-
-  useEffect(() => {
-    if (!senderRuntime || !senderCameraEnabled) {
-      return;
-    }
-
-    let intervalId = 0;
-    intervalId = window.setInterval(() => {
-      setSenderRuntime((current) => {
-        if (!current) {
-          return current;
-        }
-
-        if (current.phase === "paused" || current.phase === "done") {
-          return current;
-        }
-
-        if (current.phase === "manifest") {
-          return {
-            ...current,
-            activeFrame: current.prepared.manifestFrame
-          };
-        }
-
-        const chunk = current.prepared.chunks[current.currentChunkIndex];
-        if (!chunk) {
-          return {
-            ...current,
-            phase: "done",
-            activeFrame: null
-          };
-        }
-
-        const cycle = [...chunk.dataFrames, ...chunk.parityFrames];
-        const activeFrame = cycle[current.frameCursor % cycle.length];
-
-        return {
-          ...current,
-          activeFrame,
-          frameCursor: current.frameCursor + 1
-        };
-      });
-    }, 1000 / DEFAULT_CALIBRATION_PROFILE.transmitFps);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [senderRuntime, senderCameraEnabled]);
-
-  useEffect(() => {
-    if (!senderCameraEnabled || !senderVideoRef.current) {
-      return;
-    }
-
-    let disposed = false;
-    let animationFrame = 0;
-
-    const boot = async () => {
-      if (!senderVideoRef.current) {
-        return;
+    let cancelled = false;
+    void renderQrStage(canvas, senderFrameText, senderFrameLabel).catch(() => {
+      if (!cancelled) {
+        setStatus("QR rendering failed for the current frame.");
       }
-
-      senderStreamRef.current = await startCamera(senderVideoRef.current);
-      const loop = () => {
-        if (disposed || !senderVideoRef.current) {
-          return;
-        }
-
-        const image = readVideoFrame(senderVideoRef.current, senderCaptureCanvasRef.current);
-        if (image) {
-          const decoded = decodePacketFromImage(image);
-          const calibration = scoreCalibration({
-            noise: decoded ? 0.06 : 0.2,
-            blur: decoded ? 0.08 : 0.2,
-            brightnessDrift: decoded ? Math.abs(decoded.threshold - 128) / 255 : 0.25,
-            droppedFrameRate: 0.02
-          });
-
-          setSenderRuntime((current) =>
-            current
-              ? {
-                  ...current,
-                  calibrationScore: calibration
-                }
-              : current
-          );
-
-          if (decoded) {
-            const frame = decodeFrame(decoded.packet);
-            if (frame?.frameType === "control") {
-              const control = decodeControlPayload(frame.payload, frame.sessionId);
-              if (control) {
-                setSenderRuntime((current) => {
-                  if (!current || control.sessionId !== current.prepared.manifest.sessionId) {
-                    return current;
-                  }
-
-                  if (
-                    current.lastControl?.controlType === control.controlType &&
-                    current.lastControl?.ackChunk === control.ackChunk &&
-                    current.lastControl?.nackChunk === control.nackChunk
-                  ) {
-                    return {
-                      ...current,
-                      duplicates: current.duplicates + 1,
-                      lastControl: control
-                    };
-                  }
-
-                  if (control.controlType === "manifest_ack") {
-                    setStatus("Manifest acknowledged. Streaming payload frames.");
-                    return {
-                      ...current,
-                      phase: "sending",
-                      lastControl: control,
-                      frameCursor: 0
-                    };
-                  }
-
-                  if (control.controlType === "pause") {
-                    setStatus("Receiver asked the sender to pause.");
-                    return {
-                      ...current,
-                      phase: "paused",
-                      lastControl: control
-                    };
-                  }
-
-                  if (control.controlType === "resume") {
-                    setStatus("Receiver resumed the link.");
-                    return {
-                      ...current,
-                      phase: current.phase === "paused" ? "sending" : current.phase,
-                      lastControl: control
-                    };
-                  }
-
-                  if (control.controlType === "nack" && control.nackChunk !== undefined) {
-                    setStatus(`Chunk ${control.nackChunk} needs retransmission.`);
-                    return {
-                      ...current,
-                      currentChunkIndex: control.nackChunk,
-                      frameCursor: 0,
-                      retransmits: current.retransmits + 1,
-                      lastControl: control,
-                      phase: "sending"
-                    };
-                  }
-
-                  if (control.controlType === "ack" && control.ackChunk !== undefined) {
-                    const nextChunk = control.ackChunk + 1;
-                    if (nextChunk >= current.prepared.manifest.chunkCount) {
-                      setStatus("All chunks acknowledged. Waiting for final completion signal.");
-                      return {
-                        ...current,
-                        phase: "done",
-                        currentChunkIndex: nextChunk,
-                        activeFrame: null,
-                        lastControl: control
-                      };
-                    }
-
-                    setStatus(`Chunk ${control.ackChunk} confirmed. Advancing to chunk ${nextChunk}.`);
-                    return {
-                      ...current,
-                      currentChunkIndex: nextChunk,
-                      frameCursor: 0,
-                      lastControl: control,
-                      phase: "sending"
-                    };
-                  }
-
-                  if (control.controlType === "complete") {
-                    setStatus("Receiver completed the file and verified integrity.");
-                    return {
-                      ...current,
-                      phase: "done",
-                      activeFrame: null,
-                      lastControl: control
-                    };
-                  }
-
-                  return {
-                    ...current,
-                    lastControl: control
-                  };
-                });
-              }
-            }
-          }
-        }
-
-        animationFrame = window.requestAnimationFrame(loop);
-      };
-
-      animationFrame = window.requestAnimationFrame(loop);
-    };
-
-    void boot();
+    });
 
     return () => {
-      disposed = true;
-      window.cancelAnimationFrame(animationFrame);
-      stopCamera(senderStreamRef.current);
-      senderStreamRef.current = null;
+      cancelled = true;
     };
-  }, [senderCameraEnabled]);
+  }, [senderFrameText, senderFrameLabel, senderFullscreen]);
 
   useEffect(() => {
-    if (!receiverCameraEnabled || !receiverVideoRef.current) {
+    if (!senderState) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      setSenderState((current) =>
+        current
+          ? {
+              ...current,
+              tick: current.tick + 1
+            }
+          : current
+      );
+    }, frameIntervalMs);
+
+    return () => window.clearInterval(intervalId);
+  }, [senderState, frameIntervalMs]);
+
+  useEffect(() => {
+    if (!receiverEnabled || !receiverVideoRef.current) {
       return;
     }
 
     let disposed = false;
-    let animationFrame = 0;
+    let frameHandle = 0;
 
     const boot = async () => {
       if (!receiverVideoRef.current) {
         return;
       }
 
-      receiverStreamRef.current = await startCamera(receiverVideoRef.current);
+      try {
+        receiverStreamRef.current = await startCamera(receiverVideoRef.current);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Camera access failed.";
+        setReceiverDiagnostics((current) => ({
+          ...current,
+          permissionError: message,
+          guidance: "Camera permission failed. Allow camera access and retry."
+        }));
+        setStatus("Receiver camera could not start. Allow camera permission and retry.");
+        return;
+      }
+
+      setReceiverDiagnostics((current) => ({
+        ...current,
+        cameraReady: true,
+        guidance: "Camera live. Point it at the sender QR and hold steady until the manifest is decoded."
+      }));
+
       const loop = () => {
         if (disposed || !receiverVideoRef.current) {
           return;
@@ -379,285 +343,194 @@ function App() {
 
         const image = readVideoFrame(receiverVideoRef.current, receiverCaptureCanvasRef.current);
         if (image) {
-          const decoded = decodePacketFromImage(image);
-          const calibration = scoreCalibration({
-            noise: decoded ? 0.05 : 0.22,
-            blur: decoded ? 0.09 : 0.24,
-            brightnessDrift: decoded ? Math.abs(decoded.threshold - 128) / 255 : 0.24,
-            droppedFrameRate: 0.02
+          setReceiverDiagnostics((current) => ({
+            ...current,
+            framesSeen: current.framesSeen + 1
+          }));
+
+          const code = jsQR(image.data, image.width, image.height, {
+            inversionAttempts: "dontInvert"
           });
 
-          if (decoded) {
-            const envelope = decodeFrame(decoded.packet);
-            if (envelope?.direction === "forward") {
-              setReceiverRuntime((current) => {
-                const nextState = {
-                  ...current,
-                  calibrationScore: calibration
-                };
+          if (code) {
+            const parsed = parseQrPayload(code.data);
+            const bounds = qrBoundsFromLocation(code.location, image.width, image.height);
 
-                if (envelope.frameType === "manifest") {
-                  const manifest = decodeManifestFrame(envelope);
-                  if (!manifest) {
-                    return nextState;
-                  }
-
-                  if (current.downloadUrl) {
-                    URL.revokeObjectURL(current.downloadUrl);
-                  }
-
-                  setStatus(`Manifest received for ${manifest.name}.`);
-                  return {
-                    ...emptyReceiverState(),
-                    manifest,
-                    phase: "receiving",
-                    startedAt: Date.now(),
-                    calibrationScore: calibration,
-                    chunks: new Array(manifest.chunkCount),
-                    activeControl: encodeControlFrame({
-                      sessionId: manifest.sessionId,
-                      controlType: "manifest_ack",
-                      receiverState: 1
-                    }),
-                    lastConfirmedChunk: -1
-                  };
-                }
-
-                if (!current.manifest || current.manifest.sessionId !== envelope.sessionId) {
-                  return nextState;
-                }
-
-                if (envelope.chunkId < current.lastConfirmedChunk + 1) {
-                  return {
-                    ...nextState,
-                    duplicateFrames: current.duplicateFrames + 1,
-                    activeControl: encodeControlFrame({
-                      sessionId: current.manifest.sessionId,
-                      controlType: "ack",
-                      ackChunk: current.lastConfirmedChunk,
-                      receiverState: 2
-                    })
-                  };
-                }
-
-                if (envelope.chunkId > current.lastConfirmedChunk + 1) {
-                  return {
-                    ...nextState,
-                    activeControl: encodeControlFrame({
-                      sessionId: current.manifest.sessionId,
-                      controlType: "nack",
-                      nackChunk: current.lastConfirmedChunk + 1,
-                      receiverState: 2
-                    })
-                  };
-                }
-
-                let chunkState = current.currentChunkState;
-                if (!chunkState || chunkState.chunkId !== envelope.chunkId) {
-                  chunkState = createChunkDecodeState(envelope);
-                }
-
-                if (
-                  envelope.frameType === "data" &&
-                  chunkState.frames.has(envelope.frameId)
-                ) {
-                  return {
-                    ...nextState,
-                    duplicateFrames: current.duplicateFrames + 1
-                  };
-                }
-
-                const result = applyFrameToChunkState(chunkState, envelope);
-                if (!result.completed || !result.chunkBytes) {
-                  return {
-                    ...nextState,
-                    currentChunkState: chunkState
-                  };
-                }
-
-                const chunks = [...current.chunks];
-                chunks[envelope.chunkId] = result.chunkBytes;
-                const lastConfirmedChunk = envelope.chunkId;
-
-                if (lastConfirmedChunk === current.manifest.chunkCount - 1) {
-                  void finalizeReceiverTransfer(current.manifest, chunks, current.downloadUrl)
-                    .then(({ url, error, receivedName }) => {
-                      setReceiverRuntime((latest) => ({
-                        ...latest,
-                        phase: error ? "receiving" : "complete",
-                        downloadUrl: url,
-                        error,
-                        receivedName,
-                        activeControl: encodeControlFrame({
-                          sessionId: current.manifest!.sessionId,
-                          controlType: error ? "nack" : "complete",
-                          nackChunk: error ? lastConfirmedChunk : undefined,
-                          receiverState: error ? 3 : 4
-                        })
-                      }));
-                    })
-                    .catch((error: Error) => {
-                      setReceiverRuntime((latest) => ({
-                        ...latest,
-                        error: error.message,
-                        activeControl: encodeControlFrame({
-                          sessionId: current.manifest!.sessionId,
-                          controlType: "nack",
-                          nackChunk: lastConfirmedChunk,
-                          receiverState: 3
-                        })
-                      }));
-                    });
-
-                  setStatus("All chunks reconstructed. Verifying final payload.");
-                  return {
-                    ...nextState,
-                    chunks,
-                    currentChunkState: null,
-                    lastConfirmedChunk,
-                    activeControl: encodeControlFrame({
-                      sessionId: current.manifest.sessionId,
-                      controlType: "ack",
-                      ackChunk: lastConfirmedChunk,
-                      receiverState: 3
-                    })
-                  };
-                }
-
-                setStatus(`Chunk ${lastConfirmedChunk} verified on receiver.`);
-                return {
-                  ...nextState,
-                  chunks,
-                  currentChunkState: null,
-                  lastConfirmedChunk,
-                  activeControl: encodeControlFrame({
-                    sessionId: current.manifest.sessionId,
-                    controlType: "ack",
-                    ackChunk: lastConfirmedChunk,
-                    receiverState: 2
-                  })
-                };
-              });
-            }
-          } else {
-            setReceiverRuntime((current) => ({
+            setReceiverDiagnostics((current) => ({
               ...current,
-              calibrationScore: calibration
+              qrDetections: current.qrDetections + 1,
+              lastBounds: bounds,
+              lastKind: parsed?.manifest ? "manifest" : parsed?.shard ? "shard" : "unknown"
             }));
+
+            if (parsed?.manifest) {
+              const currentSession = receiverSessionRef.current;
+              const sameSession =
+                currentSession?.manifest.sessionId === parsed.manifest.sessionId &&
+                currentSession.manifest.hash === parsed.manifest.hash;
+
+              if (!sameSession) {
+                if (
+                  currentSession &&
+                  currentSession.received.size > 0 &&
+                  currentSession.received.size < currentSession.manifest.totalShards
+                ) {
+                  setReceiverDiagnostics((current) => ({
+                    ...current,
+                    manifestHits: current.manifestHits + 1,
+                    guidance: "A different manifest was seen, but the receiver is staying on the active session until it completes."
+                  }));
+                } else {
+                  const session = createReceiverSession(parsed.manifest);
+                  receiverSessionRef.current = session;
+                  setReceiverManifest(parsed.manifest);
+                  setReceiverProgress({
+                    received: 0,
+                    total: parsed.manifest.totalShards,
+                    startedAt: Date.now()
+                  });
+                  setReceiverDiagnostics((current) => ({
+                    ...current,
+                    manifestHits: current.manifestHits + 1,
+                    guidance: "Manifest decoded. Receiver is now collecting shard QRs in any order."
+                  }));
+                  setStatus(
+                    `Manifest locked for ${parsed.manifest.name}. Collecting ${parsed.manifest.totalShards} shards in any order.`
+                  );
+                }
+              } else {
+                setReceiverDiagnostics((current) => ({
+                  ...current,
+                  manifestHits: current.manifestHits + 1,
+                  guidance: "Manifest reacquired. Continuing the current shard collection without resetting progress."
+                }));
+              }
+            }
+
+            if (parsed?.shard && receiverSessionRef.current) {
+              const result = applyShard(receiverSessionRef.current, parsed.shard);
+
+              setReceiverDiagnostics((current) => ({
+                ...current,
+                shardHits: current.shardHits + 1,
+                uniqueShards: receiverSessionRef.current?.received.size ?? current.uniqueShards,
+                duplicates: current.duplicates + (result.duplicate ? 1 : 0),
+                guidance: result.complete
+                  ? "All shards received. Verifying payload."
+                  : "Shard decoded. Keep the camera steady while remaining shards accumulate."
+              }));
+
+              setReceiverProgress((current) => ({
+                ...current,
+                received: receiverSessionRef.current?.received.size ?? current.received
+              }));
+
+              if (result.complete) {
+                void finalizeQrSession(receiverSessionRef.current, receiverDownloadUrl)
+                  .then(({ url, name, error }) => {
+                    if (error) {
+                      setReceiverError(error);
+                      setStatus(error);
+                      return;
+                    }
+
+                    setReceiverError(null);
+                    setReceiverDownloadUrl(url);
+                    setReceiverDownloadName(name);
+                    setStatus("Transfer complete. Payload verified and ready to download.");
+                  })
+                  .catch((error: Error) => {
+                    setReceiverError(error.message);
+                    setStatus(error.message);
+                  });
+              }
+            }
           }
         }
 
-        animationFrame = window.requestAnimationFrame(loop);
+        frameHandle = window.requestAnimationFrame(loop);
       };
 
-      animationFrame = window.requestAnimationFrame(loop);
+      frameHandle = window.requestAnimationFrame(loop);
     };
 
     void boot();
 
     return () => {
       disposed = true;
-      window.cancelAnimationFrame(animationFrame);
+      window.cancelAnimationFrame(frameHandle);
       stopCamera(receiverStreamRef.current);
       receiverStreamRef.current = null;
     };
-  }, [receiverCameraEnabled]);
+  }, [receiverEnabled, receiverDownloadUrl]);
 
   async function startSender(): Promise<void> {
     const payload = await resolvePayload(file, message);
     const compressed = await compressPayload(payload.bytes);
-    const prepared = await prepareTransfer({
+    const prepared = await prepareQrTransfer({
+      bytes: compressed.bytes,
       name: payload.name,
       mimeType: payload.mimeType,
-      bytes: compressed.bytes,
       compression: compressed.compression,
-      originalSize: compressed.originalSize
+      originalSize: compressed.originalSize,
+      shardSize
     });
 
-    setSenderRuntime({
+    setSenderState({
       prepared,
-      currentChunkIndex: 0,
-      frameCursor: 0,
-      retransmits: 0,
-      duplicates: 0,
-      lastControl: null,
-      phase: "manifest",
       startedAt: Date.now(),
-      activeFrame: prepared.manifestFrame,
-      calibrationScore: 0
+      tick: 0
     });
-    setSenderCameraEnabled(true);
-    setStatus("Sender is repeating the manifest. Wait for manifest ACK from the receiver.");
+    setStatus(
+      `Broadcasting ${prepared.manifest.totalShards} QR shards in an infinite loop at about ${(1000 / frameIntervalMs).toFixed(2)} fps with ${shardSize} byte shards.`
+    );
   }
 
-  function stopSenderSession(): void {
-    setSenderRuntime(null);
-    setSenderCameraEnabled(false);
-    setStatus("Sender reset. Camera stopped.");
+  function stopSender(): void {
+    setSenderState(null);
+    setStatus("Sender stopped.");
   }
 
-  function startReceiver(): void {
-    setReceiverRuntime({
-      ...emptyReceiverState(),
-      phase: "listening",
-      activeControl: null,
-      startedAt: Date.now()
+  function startReceiverSession(): void {
+    if (receiverDownloadUrl) {
+      URL.revokeObjectURL(receiverDownloadUrl);
+    }
+
+    setReceiverDownloadUrl(null);
+    setReceiverDownloadName(null);
+    setReceiverError(null);
+    setReceiverManifest(null);
+    setReceiverProgress({ received: 0, total: 0, startedAt: Date.now() });
+    receiverSessionRef.current = null;
+    setReceiverDiagnostics({
+      ...emptyDiagnostics(),
+      guidance: "Receiver is starting. Point the camera at the sender QR."
     });
-    setReceiverCameraEnabled(true);
-    setStatus("Receiver is listening for manifest frames and rendering the control channel.");
+    setReceiverEnabled(true);
+    setStatus("Receiver is scanning QR frames. Manifest can arrive at any time because the sender loops forever.");
   }
 
   function stopReceiverSession(): void {
-    setReceiverCameraEnabled(false);
-    if (receiverRuntime.downloadUrl) {
-      URL.revokeObjectURL(receiverRuntime.downloadUrl);
-    }
-    setReceiverRuntime(emptyReceiverState());
-    setStatus("Receiver reset. Camera stopped.");
+    setReceiverEnabled(false);
+    receiverSessionRef.current = null;
+    setReceiverDiagnostics(emptyDiagnostics());
+    setStatus("Receiver stopped.");
   }
 
-  function requestFullscreen(stage: "sender" | "receiver"): void {
-    const element =
-      stage === "sender" ? senderCanvasRef.current?.parentElement : receiverCanvasRef.current?.parentElement;
+  function requestFullscreen(target: "sender" | "receiver"): void {
+    const element = target === "sender" ? senderLabRef.current : receiverLabRef.current;
     if (!element) {
       return;
     }
-    void element.requestFullscreen();
-    if (stage === "sender") {
-      setSenderStageFullscreen(true);
-    } else {
-      setReceiverStageFullscreen(true);
-    }
-  }
 
-  const activeStats =
-    mode === "sender" && senderRuntime
-      ? {
-          phase: senderRuntime.phase,
-          chunk: `${Math.min(senderRuntime.currentChunkIndex + 1, senderRuntime.prepared.manifest.chunkCount)} / ${senderRuntime.prepared.manifest.chunkCount}`,
-          payload: formatBytes(senderRuntime.prepared.manifest.originalSize),
-          elapsed: formatSeconds(Date.now() - senderRuntime.startedAt),
-          calibration: `${Math.round(senderRuntime.calibrationScore * 100)}%`,
-          retransmits: senderRuntime.retransmits.toString(),
-          duplicates: senderRuntime.duplicates.toString()
-        }
-      : {
-          phase: receiverRuntime.phase,
-          chunk: receiverRuntime.manifest
-            ? `${Math.max(receiverRuntime.lastConfirmedChunk + 1, 0)} / ${receiverRuntime.manifest.chunkCount}`
-            : "0 / 0",
-          payload: receiverRuntime.manifest ? formatBytes(receiverRuntime.manifest.originalSize) : "0 B",
-          elapsed: receiverRuntime.startedAt ? formatSeconds(Date.now() - receiverRuntime.startedAt) : "0.0 s",
-          calibration: `${Math.round(receiverRuntime.calibrationScore * 100)}%`,
-          retransmits: "0",
-          duplicates: receiverRuntime.duplicateFrames.toString()
-        };
+    void element.requestFullscreen();
+  }
 
   return (
     <div className="shell">
       <header className="masthead">
         <div>
-          <p className="eyebrow">Optical Transfer Workspace</p>
+          <p className="eyebrow">QR Broadcast Mode</p>
           <h1>Air T2</h1>
         </div>
         <div className="mode-switch">
@@ -682,8 +555,8 @@ function App() {
         <section className="main-pane">
           <div className="intro">
             <p>
-              One screen carries payload frames. The other screen carries compact ACK/NACK control frames.
-              Both devices use their laptop webcams to decode the opposite fullscreen stage.
+              This version stops reinventing the visual code. The sender loops a large QR manifest plus small QR shards
+              forever. The receiver is just a still camera that grabs whichever valid shards it can decode.
             </p>
           </div>
 
@@ -691,118 +564,190 @@ function App() {
             <section className="rail">
               <label className="field">
                 <span>Payload file</span>
-                <input
-                  type="file"
-                  onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-                />
+                <input type="file" onChange={(event) => setFile(event.target.files?.[0] ?? null)} />
               </label>
 
               <label className="field">
                 <span>Fallback text payload</span>
-                <textarea
-                  rows={5}
-                  value={message}
-                  onChange={(event) => setMessage(event.target.value)}
-                />
+                <textarea rows={5} value={message} onChange={(event) => setMessage(event.target.value)} />
               </label>
+
+              <div className="control-grid">
+                <label className="field">
+                  <span>Frame interval</span>
+                  <input
+                    type="range"
+                    min={MIN_FRAME_INTERVAL_MS}
+                    max={MAX_FRAME_INTERVAL_MS}
+                    step={10}
+                    value={frameIntervalMs}
+                    onChange={(event) => setFrameIntervalMs(Number.parseInt(event.target.value, 10))}
+                  />
+                  <small>{frameIntervalMs} ms per frame ({(1000 / frameIntervalMs).toFixed(2)} fps)</small>
+                </label>
+
+                <label className="field">
+                  <span>Shard size</span>
+                  <input
+                    type="range"
+                    min={MIN_SHARD_SIZE}
+                    max={MAX_SHARD_SIZE}
+                    step={8}
+                    value={shardSize}
+                    onChange={(event) => setShardSize(Number.parseInt(event.target.value, 10))}
+                  />
+                  <small>{shardSize} bytes per QR shard</small>
+                </label>
+              </div>
 
               <div className="action-row">
                 <button className="solid" onClick={() => void startSender()} type="button">
-                  Start Sender
+                  Start Broadcast
                 </button>
-                <button className="ghost" onClick={stopSenderSession} type="button">
-                  Reset
+                <button className="ghost" onClick={stopSender} type="button">
+                  Stop
                 </button>
               </div>
 
-              <div className={senderStageFullscreen ? "signal-stage is-fullscreen" : "signal-stage"}>
-                <canvas ref={senderCanvasRef} />
-                <div className="signal-stage__overlay">
-                  <p>Forward optical payload</p>
-                  <button className="ghost" onClick={() => requestFullscreen("sender")} type="button">
-                    Fullscreen stage
-                  </button>
+              <div className="link-lab" ref={senderLabRef}>
+                <div className={senderFullscreen ? "signal-stage is-fullscreen" : "signal-stage"}>
+                  <canvas ref={senderCanvasRef} />
+                  <div className="signal-stage__overlay">
+                    <p>{senderFrameLabel}</p>
+                    <button className="ghost" onClick={() => requestFullscreen("sender")} type="button">
+                      Fullscreen lab
+                    </button>
+                  </div>
                 </div>
-              </div>
 
-              <div className="camera-row">
-                <video muted playsInline ref={senderVideoRef} />
-                <div className="camera-copy">
-                  <p>ACK camera</p>
-                  <span>Use this laptop camera to read the receiver’s reverse control screen.</span>
+                <div className="lab-side">
+                  <section className="protocol-panel">
+                    <h2>Broadcast behavior</h2>
+                    <ul>
+                      <li>Every loop repeats the manifest QR, then small shard QRs.</li>
+                      <li>The receiver does not need ACKs, ordering, or simultaneous lock.</li>
+                      <li>If the camera decodes any shard, it keeps it and waits for the rest.</li>
+                    </ul>
+                  </section>
+
+                  <section className="telemetry">
+                    <h2>Sender telemetry</h2>
+                    <dl>
+                      <div>
+                        <dt>State</dt>
+                        <dd>{senderState ? "broadcasting" : "idle"}</dd>
+                      </div>
+                      <div>
+                        <dt>Payload</dt>
+                        <dd>{senderState ? formatBytes(senderState.prepared.manifest.originalSize) : "0 B"}</dd>
+                      </div>
+                      <div>
+                        <dt>Compressed</dt>
+                        <dd>{senderState ? formatBytes(senderState.prepared.manifest.compressedSize) : "0 B"}</dd>
+                      </div>
+                      <div>
+                        <dt>Shard size</dt>
+                        <dd>{senderState ? `${senderState.prepared.manifest.shardSize} B` : `${shardSize} B`}</dd>
+                      </div>
+                      <div>
+                        <dt>Total shards</dt>
+                        <dd>{senderState ? senderState.prepared.manifest.totalShards : 0}</dd>
+                      </div>
+                      <div>
+                        <dt>Frame rate</dt>
+                        <dd>{(1000 / frameIntervalMs).toFixed(2)} fps</dd>
+                      </div>
+                      <div>
+                        <dt>Elapsed</dt>
+                        <dd>{senderState ? formatSeconds(Date.now() - senderState.startedAt) : "0.0 s"}</dd>
+                      </div>
+                    </dl>
+                  </section>
                 </div>
               </div>
             </section>
           ) : (
             <section className="rail">
               <div className="action-row">
-                <button className="solid" onClick={startReceiver} type="button">
+                <button className="solid" onClick={startReceiverSession} type="button">
                   Start Receiver
                 </button>
                 <button className="ghost" onClick={stopReceiverSession} type="button">
-                  Reset
+                  Stop
                 </button>
               </div>
 
-              <div className={receiverStageFullscreen ? "signal-stage is-fullscreen" : "signal-stage"}>
-                <canvas ref={receiverCanvasRef} />
-                <div className="signal-stage__overlay">
-                  <p>Reverse optical control</p>
-                  <button className="ghost" onClick={() => requestFullscreen("receiver")} type="button">
-                    Fullscreen stage
-                  </button>
+              <div className="link-lab" ref={receiverLabRef}>
+                <div className="camera-frame camera-frame--large">
+                  <video muted playsInline ref={receiverVideoRef} />
+                  <TrackingOverlay diagnostics={receiverDiagnostics} />
+                </div>
+
+                <div className="lab-side">
+                  <div className="signal-stage signal-stage--status">
+                    <div className="receiver-board">
+                      <p className="receiver-board__eyebrow">Receiver</p>
+                      <h2>{receiverManifest ? receiverManifest.name : "Waiting For Manifest"}</h2>
+                      <p>
+                        {receiverManifest
+                          ? `Collecting shard QRs for ${formatBytes(receiverManifest.originalSize)}.`
+                          : "Point the camera at the sender QR. Hold steady until one manifest QR is decoded."}
+                      </p>
+                      <button className="ghost" onClick={() => requestFullscreen("receiver")} type="button">
+                        Fullscreen lab
+                      </button>
+                    </div>
+                  </div>
+
+                  <CameraDiagnosticsPanel diagnostics={receiverDiagnostics} />
                 </div>
               </div>
 
-              <div className="camera-row">
-                <video muted playsInline ref={receiverVideoRef} />
-                <div className="camera-copy">
-                  <p>Receive camera</p>
-                  <span>Use this laptop camera to lock onto the sender’s payload stage.</span>
-                </div>
-              </div>
-
-              {receiverRuntime.downloadUrl ? (
-                <a className="download-link" download={receiverRuntime.receivedName ?? "payload.bin"} href={receiverRuntime.downloadUrl}>
+              {receiverDownloadUrl ? (
+                <a className="download-link" download={receiverDownloadName ?? "payload.bin"} href={receiverDownloadUrl}>
                   Download reconstructed payload
                 </a>
               ) : null}
-              {receiverRuntime.error ? <p className="error">{receiverRuntime.error}</p> : null}
+              {receiverError ? <p className="error">{receiverError}</p> : null}
             </section>
           )}
         </section>
 
         <aside className="side-pane">
           <section className="telemetry">
-            <h2>Link telemetry</h2>
+            <h2>Progress</h2>
             <dl>
               <div>
-                <dt>Phase</dt>
-                <dd>{activeStats.phase}</dd>
+                <dt>Mode</dt>
+                <dd>{mode}</dd>
               </div>
               <div>
-                <dt>Chunk</dt>
-                <dd>{activeStats.chunk}</dd>
+                <dt>Manifest</dt>
+                <dd>{receiverManifest ? "locked" : "not yet"}</dd>
+              </div>
+              <div>
+                <dt>Shards</dt>
+                <dd>
+                  {receiverProgress.total > 0
+                    ? `${receiverProgress.received} / ${receiverProgress.total}`
+                    : senderState
+                      ? `${senderState.prepared.manifest.totalShards} broadcast`
+                      : "0 / 0"}
+                </dd>
               </div>
               <div>
                 <dt>Payload</dt>
-                <dd>{activeStats.payload}</dd>
+                <dd>
+                  {receiverManifest
+                    ? formatBytes(receiverManifest.originalSize)
+                    : senderState
+                      ? formatBytes(senderState.prepared.manifest.originalSize)
+                      : "0 B"}
+                </dd>
               </div>
               <div>
                 <dt>Elapsed</dt>
-                <dd>{activeStats.elapsed}</dd>
-              </div>
-              <div>
-                <dt>Calibration</dt>
-                <dd>{activeStats.calibration}</dd>
-              </div>
-              <div>
-                <dt>Retransmits</dt>
-                <dd>{activeStats.retransmits}</dd>
-              </div>
-              <div>
-                <dt>Duplicates</dt>
-                <dd>{activeStats.duplicates}</dd>
+                <dd>{receiverProgress.startedAt ? formatSeconds(Date.now() - receiverProgress.startedAt) : "0.0 s"}</dd>
               </div>
             </dl>
           </section>
@@ -810,9 +755,9 @@ function App() {
           <section className="notes">
             <h2>Field notes</h2>
             <ul>
-              <li>Keep both stages fullscreen and max brightness during active transfer.</li>
-              <li>Monochrome high-contrast cells survive webcam exposure drift better than color-coded payloads.</li>
-              <li>Manifest and chunk ACK use the same reverse channel renderer, so both peers can reuse one decoder.</li>
+              <li>Use maximum screen brightness and fill the camera view with the QR.</li>
+              <li>This build prefers working slowly over pushing bitrate.</li>
+              <li>If manifest locks but shard count stalls, move closer and keep the screen square to the camera.</li>
             </ul>
           </section>
 
@@ -825,49 +770,111 @@ function App() {
   );
 }
 
-async function finalizeReceiverTransfer(
-  manifest: TransferManifest,
-  chunks: Uint8Array[],
+function CameraDiagnosticsPanel({ diagnostics }: { diagnostics: ReceiverDiagnostics }) {
+  return (
+    <section className="debug-panel">
+      <h2>Receiver Diagnostics</h2>
+      <p className="debug-status">{diagnostics.guidance}</p>
+      <dl>
+        <div>
+          <dt>Camera</dt>
+          <dd>{diagnostics.cameraReady ? "live" : "idle"}</dd>
+        </div>
+        <div>
+          <dt>Frames seen</dt>
+          <dd>{diagnostics.framesSeen}</dd>
+        </div>
+        <div>
+          <dt>QR detections</dt>
+          <dd>{diagnostics.qrDetections}</dd>
+        </div>
+        <div>
+          <dt>Manifest hits</dt>
+          <dd>{diagnostics.manifestHits}</dd>
+        </div>
+        <div>
+          <dt>Shard hits</dt>
+          <dd>{diagnostics.shardHits}</dd>
+        </div>
+        <div>
+          <dt>Unique shards</dt>
+          <dd>{diagnostics.uniqueShards}</dd>
+        </div>
+        <div>
+          <dt>Duplicates</dt>
+          <dd>{diagnostics.duplicates}</dd>
+        </div>
+        <div>
+          <dt>Last kind</dt>
+          <dd>{diagnostics.lastKind}</dd>
+        </div>
+      </dl>
+      {diagnostics.permissionError ? <p className="error">{diagnostics.permissionError}</p> : null}
+    </section>
+  );
+}
+
+function TrackingOverlay({ diagnostics }: { diagnostics: ReceiverDiagnostics }) {
+  return (
+    <div className="camera-overlay">
+      <div className="camera-overlay__hud">
+        <span>{diagnostics.cameraReady ? "camera live" : "camera idle"}</span>
+        <span>{diagnostics.qrDetections > 0 ? "qr seen" : "scanning"}</span>
+        <span>{diagnostics.uniqueShards > 0 ? `${diagnostics.uniqueShards} shards saved` : "no shards yet"}</span>
+      </div>
+      {diagnostics.lastBounds ? (
+        <div
+          className="camera-overlay__box"
+          style={{
+            left: `${diagnostics.lastBounds.left}%`,
+            top: `${diagnostics.lastBounds.top}%`,
+            width: `${diagnostics.lastBounds.width}%`,
+            height: `${diagnostics.lastBounds.height}%`
+          }}
+        >
+          <span>{diagnostics.lastKind}</span>
+        </div>
+      ) : (
+        <div className="camera-overlay__scan">
+          <span>align sender QR here</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+async function finalizeQrSession(
+  session: ReceiverSession,
   previousUrl: string | null
-): Promise<{ url: string | null; error: string | null; receivedName: string | null }> {
-  const totalLength = chunks.reduce((sum, chunk) => sum + (chunk?.length ?? 0), 0);
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    if (!chunk) {
-      return {
-        url: null,
-        error: "A chunk was missing during final assembly.",
-        receivedName: null
-      };
-    }
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  const payload = await materializePayload(merged, manifest.compression);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", new Uint8Array(payload));
-  const hash = Array.from(new Uint8Array(hashBuffer))
-    .map((value) => value.toString(16).padStart(2, "0"))
-    .join("");
-
-  if (hash !== manifest.fileHash) {
+): Promise<{ url: string | null; name: string | null; error: string | null }> {
+  const assembled = assembleReceiverSession(session);
+  if (!assembled) {
     return {
-      url: previousUrl,
-      error: "Whole-file hash mismatch after reconstruction.",
-      receivedName: null
+      url: null,
+      name: null,
+      error: "Receiver completed without all shards present."
     };
   }
 
+  const compressedHash = await sha256Hex(assembled);
+  if (compressedHash !== session.manifest.hash) {
+    return {
+      url: null,
+      name: null,
+      error: "Shard set assembled, but hash verification failed."
+    };
+  }
+
+  const payload = await materializePayload(assembled, session.manifest.compression);
   if (previousUrl) {
     URL.revokeObjectURL(previousUrl);
   }
 
-  const blob = new Blob([new Uint8Array(payload)], { type: manifest.mimeType });
+  const blob = new Blob([new Uint8Array(payload)], { type: session.manifest.mimeType });
   return {
     url: URL.createObjectURL(blob),
-    error: null,
-    receivedName: manifest.name
+    name: session.manifest.name,
+    error: null
   };
 }
 
@@ -883,9 +890,8 @@ async function resolvePayload(
     };
   }
 
-  const fallback = new TextEncoder().encode(message.trim() || "Air T2 optical payload");
   return {
-    bytes: fallback,
+    bytes: new TextEncoder().encode(message.trim() || "Air T2 QR broadcast payload"),
     name: "message.txt",
     mimeType: "text/plain"
   };

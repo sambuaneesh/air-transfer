@@ -15,6 +15,8 @@ import type {
 
 const HEADER_SIZE = 27;
 const CRC_SIZE = 4;
+const MAX_MANIFEST_NAME_BYTES = 24;
+const MAX_MANIFEST_MIME_BYTES = 16;
 
 const frameTypeMap: Record<FrameType, number> = {
   manifest: 1,
@@ -57,6 +59,26 @@ function sessionIdToNumber(sessionId: string): number {
 
 function numberToSessionId(value: number): string {
   return value.toString(16).padStart(8, "0");
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const normalized = hex.trim().toLowerCase();
+  if (normalized.length !== 64) {
+    return new Uint8Array(32);
+  }
+
+  const bytes = new Uint8Array(32);
+  for (let index = 0; index < 32; index += 1) {
+    const value = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16);
+    bytes[index] = Number.isNaN(value) ? 0 : value;
+  }
+  return bytes;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 export function encodeFrame(frame: FrameEnvelope): Uint8Array {
@@ -132,11 +154,59 @@ export function decodeFrame(packet: Uint8Array): FrameEnvelope | null {
 }
 
 export function encodeManifestPayload(manifest: TransferManifest): Uint8Array {
-  return new TextEncoder().encode(JSON.stringify(manifest));
+  const encoder = new TextEncoder();
+  const nameBytes = encoder.encode(manifest.name).slice(0, MAX_MANIFEST_NAME_BYTES);
+  const mimeBytes = encoder.encode(manifest.mimeType).slice(0, MAX_MANIFEST_MIME_BYTES);
+  const hashBytes = hexToBytes(manifest.fileHash);
+  const buffer = new ArrayBuffer(51 + nameBytes.length + mimeBytes.length);
+  const view = new DataView(buffer);
+  const bytes = new Uint8Array(buffer);
+
+  view.setUint32(0, sessionIdToNumber(manifest.sessionId));
+  view.setUint32(4, manifest.originalSize);
+  view.setUint32(8, manifest.compressedSize);
+  view.setUint16(12, manifest.chunkSize);
+  view.setUint16(14, manifest.chunkCount);
+  bytes.set(hashBytes, 16);
+  view.setUint8(48, manifest.compression === "gzip" ? 1 : 0);
+  view.setUint8(49, nameBytes.length);
+  bytes.set(nameBytes, 50);
+  view.setUint8(50 + nameBytes.length, mimeBytes.length);
+  bytes.set(mimeBytes, 51 + nameBytes.length);
+
+  return bytes;
 }
 
 export function decodeManifestPayload(payload: Uint8Array): TransferManifest {
-  return JSON.parse(new TextDecoder().decode(payload)) as TransferManifest;
+  if (payload.length < 51) {
+    throw new Error("Manifest payload too short.");
+  }
+
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const nameLength = view.getUint8(49);
+  const mimeLengthOffset = 50 + nameLength;
+  if (payload.length < mimeLengthOffset + 1) {
+    throw new Error("Manifest payload is truncated before MIME length.");
+  }
+
+  const mimeLength = view.getUint8(mimeLengthOffset);
+  const mimeStart = mimeLengthOffset + 1;
+  if (payload.length < mimeStart + mimeLength) {
+    throw new Error("Manifest payload is truncated before MIME bytes.");
+  }
+
+  const decoder = new TextDecoder();
+  return {
+    sessionId: numberToSessionId(view.getUint32(0)),
+    originalSize: view.getUint32(4),
+    compressedSize: view.getUint32(8),
+    chunkSize: view.getUint16(12),
+    chunkCount: view.getUint16(14),
+    fileHash: bytesToHex(payload.slice(16, 48)),
+    compression: view.getUint8(48) === 1 ? "gzip" : "none",
+    name: decoder.decode(payload.slice(50, 50 + nameLength)),
+    mimeType: decoder.decode(payload.slice(mimeStart, mimeStart + mimeLength))
+  };
 }
 
 export function encodeControlPayload(frame: ControlFrame): Uint8Array {

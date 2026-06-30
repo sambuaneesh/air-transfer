@@ -120,6 +120,37 @@ button {
   margin-top: 28px;
 }
 
+.link-lab {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.lab-side {
+  display: grid;
+  gap: 18px;
+}
+
+.link-lab:fullscreen {
+  padding: 20px;
+  background:
+    radial-gradient(circle at top left, rgba(104, 240, 193, 0.08), transparent 34%),
+    radial-gradient(circle at bottom right, rgba(255, 210, 111, 0.08), transparent 30%),
+    linear-gradient(160deg, var(--bg) 0%, var(--bg-2) 100%);
+  grid-template-columns: minmax(0, 1.35fr) minmax(360px, 0.65fr);
+  align-content: stretch;
+  min-height: 100vh;
+}
+
+.link-lab:fullscreen .signal-stage {
+  min-height: calc(100vh - 40px);
+}
+
+.link-lab:fullscreen .camera-frame video {
+  min-height: 320px;
+}
+
 .field {
   display: grid;
   gap: 10px;
@@ -128,7 +159,8 @@ button {
 .field span,
 .camera-copy p,
 .telemetry h2,
-.notes h2 {
+.notes h2,
+.debug-panel h2 {
   font-family: "IBM Plex Mono", monospace;
   font-size: 0.86rem;
   letter-spacing: 0.06em;
@@ -150,6 +182,16 @@ button {
 .field textarea {
   resize: vertical;
   min-height: 132px;
+}
+
+.field small {
+  color: var(--muted);
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
 }
 
 .action-row {
@@ -227,9 +269,12 @@ button {
 
 .camera-row {
   display: grid;
-  grid-template-columns: minmax(220px, 320px) minmax(0, 1fr);
-  align-items: center;
-  gap: 18px;
+  gap: 16px;
+  align-items: start;
+}
+
+.camera-frame {
+  position: relative;
 }
 
 .camera-row video {
@@ -241,10 +286,133 @@ button {
   border: 1px solid var(--line);
 }
 
+.camera-frame--large video {
+  min-height: 560px;
+}
+
+.camera-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  border-radius: 20px;
+  overflow: hidden;
+}
+
+.camera-overlay__hud {
+  position: absolute;
+  inset: 12px 12px auto 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.camera-overlay__hud span,
+.camera-overlay__box span,
+.camera-overlay__scan span {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.camera-overlay__hud span {
+  padding: 6px 8px;
+  border-radius: 999px;
+  background: rgba(5, 8, 12, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.camera-overlay__box {
+  position: absolute;
+  border: 2px solid var(--mint);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+
+.camera-overlay__box span {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translateY(-100%);
+  padding: 4px 6px;
+  background: rgba(104, 240, 193, 0.9);
+  color: #071118;
+}
+
+.camera-overlay__scan {
+  position: absolute;
+  inset: 22% 18%;
+  border: 1px dashed rgba(255, 255, 255, 0.35);
+  border-radius: 18px;
+  display: grid;
+  place-items: center;
+}
+
+.camera-overlay__scan span {
+  padding: 6px 10px;
+  background: rgba(5, 8, 12, 0.72);
+  border-radius: 999px;
+  color: var(--muted);
+}
+
 .camera-copy span,
 .notes li,
 .status-strip,
 .error {
+  color: var(--muted);
+}
+
+.debug-panel {
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.debug-status {
+  margin: 0 0 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.debug-panel dl {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.debug-panel dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.debug-panel dt {
+  color: var(--muted);
+}
+
+.debug-panel dd {
+  margin: 0;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.protocol-panel {
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.protocol-panel h2 {
+  margin: 0 0 12px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.86rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.protocol-panel ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 10px;
+  line-height: 1.5;
   color: var(--muted);
 }
 
@@ -297,6 +465,40 @@ button {
   margin: 0;
 }
 
+.signal-stage--status {
+  display: grid;
+  place-items: center;
+  padding: 22px;
+}
+
+.receiver-board {
+  width: 100%;
+  max-width: 32rem;
+  display: grid;
+  gap: 16px;
+}
+
+.receiver-board__eyebrow {
+  margin: 0;
+  font-family: "IBM Plex Mono", monospace;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--mint);
+  font-size: 0.74rem;
+}
+
+.receiver-board h2 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3vw, 3rem);
+  line-height: 1;
+}
+
+.receiver-board p {
+  margin: 0;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
 @keyframes rise {
   from {
     opacity: 0;
@@ -315,9 +517,14 @@ button {
 
   .masthead,
   .workspace,
-  .camera-row {
+  .camera-row,
+  .link-lab {
     grid-template-columns: 1fr;
     display: grid;
+  }
+
+  .link-lab:fullscreen {
+    grid-template-columns: 1fr;
   }
 
   .masthead {

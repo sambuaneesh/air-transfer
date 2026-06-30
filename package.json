@@ -10,6 +10,7 @@
     "dev": "npm run dev -w @airt2/web",
     "build": "npm run build -w @airt2/protocol && npm run build -w @airt2/simulator && npm run build -w @airt2/web",
     "test": "npm run test -w @airt2/protocol",
-    "check": "npm run build && npm run test"
+    "check": "npm run build && npm run test",
+    "portable:bundle": "npm run build -w @airt2/web && node scripts/package-portable.mjs"
   }
 }
