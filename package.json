@@ -1,0 +1,15 @@
+{
+  "name": "air-t2",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @airt2/web",
+    "build": "npm run build -w @airt2/protocol && npm run build -w @airt2/simulator && npm run build -w @airt2/web",
+    "test": "npm run test -w @airt2/protocol",
+    "check": "npm run build && npm run test"
+  }
+}
