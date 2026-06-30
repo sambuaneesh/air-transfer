@@ -3,7 +3,12 @@ import jsQR from "jsqr";
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { readVideoFrame, startCamera, stopCamera } from "./lib/camera";
+import {
+  readVideoFrame,
+  startCamera,
+  stopCamera,
+  type CameraPreference
+} from "./lib/camera";
 import { compressPayload, materializePayload } from "./lib/payload";
 import {
   applyShard,
@@ -226,6 +231,7 @@ function App() {
   const [senderState, setSenderState] = useState<SenderState | null>(null);
   const [receiverDiagnostics, setReceiverDiagnostics] = useState<ReceiverDiagnostics>(() => emptyDiagnostics());
   const [receiverEnabled, setReceiverEnabled] = useState(false);
+  const [receiverCameraPreference, setReceiverCameraPreference] = useState<CameraPreference>("back");
   const [receiverManifest, setReceiverManifest] = useState<QrManifest | null>(null);
   const [receiverProgress, setReceiverProgress] = useState({ received: 0, total: 0, startedAt: 0 });
   const [receiverDownloadUrl, setReceiverDownloadUrl] = useState<string | null>(null);
@@ -318,7 +324,7 @@ function App() {
       }
 
       try {
-        receiverStreamRef.current = await startCamera(receiverVideoRef.current);
+        receiverStreamRef.current = await startCamera(receiverVideoRef.current, receiverCameraPreference);
       } catch (error) {
         const message = error instanceof Error ? error.message : "Camera access failed.";
         setReceiverDiagnostics((current) => ({
@@ -330,11 +336,16 @@ function App() {
         return;
       }
 
-      setReceiverDiagnostics((current) => ({
-        ...current,
-        cameraReady: true,
-        guidance: "Camera live. Point it at the sender QR and hold steady until the manifest is decoded."
-      }));
+        setReceiverDiagnostics((current) => ({
+          ...current,
+          cameraReady: true,
+          guidance:
+            receiverCameraPreference === "back"
+              ? "Back camera live. Point it at the sender QR and hold steady until the manifest is decoded."
+              : receiverCameraPreference === "front"
+                ? "Front camera live. Point it at the sender QR and hold steady until the manifest is decoded."
+                : "Camera live. Point it at the sender QR and hold steady until the manifest is decoded."
+        }));
 
       const loop = () => {
         if (disposed || !receiverVideoRef.current) {
@@ -462,7 +473,7 @@ function App() {
       stopCamera(receiverStreamRef.current);
       receiverStreamRef.current = null;
     };
-  }, [receiverEnabled, receiverDownloadUrl]);
+  }, [receiverEnabled, receiverDownloadUrl, receiverCameraPreference]);
 
   async function startSender(): Promise<void> {
     const payload = await resolvePayload(file, message);
@@ -668,6 +679,19 @@ function App() {
             </section>
           ) : (
             <section className="rail">
+              <label className="field">
+                <span>Receiver camera</span>
+                <select
+                  value={receiverCameraPreference}
+                  onChange={(event) => setReceiverCameraPreference(event.target.value as CameraPreference)}
+                >
+                  <option value="back">Back camera</option>
+                  <option value="front">Front camera</option>
+                  <option value="auto">Auto</option>
+                </select>
+                <small>On mobile, choose the back camera for better focus and a wider field of view.</small>
+              </label>
+
               <div className="action-row">
                 <button className="solid" onClick={startReceiverSession} type="button">
                   Start Receiver

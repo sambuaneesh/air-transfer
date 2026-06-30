@@ -1,18 +1,66 @@
-export async function startCamera(
-  video: HTMLVideoElement
+export type CameraPreference = "auto" | "back" | "front";
+
+async function openCamera(
+  video: HTMLVideoElement,
+  constraints: MediaTrackConstraints
 ): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getUserMedia({
-    video: {
-      width: { ideal: 1280 },
-      height: { ideal: 720 },
-      frameRate: { ideal: 30, max: 30 }
-    },
+    video: constraints,
     audio: false
   });
 
   video.srcObject = stream;
   await video.play();
   return stream;
+}
+
+export async function startCamera(
+  video: HTMLVideoElement,
+  preference: CameraPreference = "auto"
+): Promise<MediaStream> {
+  const baseConstraints: MediaTrackConstraints = {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 30 }
+  };
+
+  const attempts: MediaTrackConstraints[] =
+    preference === "back"
+      ? [
+          {
+            ...baseConstraints,
+            facingMode: { exact: "environment" }
+          },
+          {
+            ...baseConstraints,
+            facingMode: { ideal: "environment" }
+          },
+          baseConstraints
+        ]
+      : preference === "front"
+        ? [
+            {
+              ...baseConstraints,
+              facingMode: { exact: "user" }
+            },
+            {
+              ...baseConstraints,
+              facingMode: { ideal: "user" }
+            },
+            baseConstraints
+          ]
+        : [baseConstraints];
+
+  let lastError: unknown;
+  for (const constraints of attempts) {
+    try {
+      return await openCamera(video, constraints);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Camera access failed.");
 }
 
 export function stopCamera(stream: MediaStream | null): void {
