@@ -1,9 +1,12 @@
 use crate::color::PaletteEntry;
-use crate::camera::RgbImage;
 use crate::error::Result;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::camera::RgbImage;
 
 /// Build a calibration mapping from a captured image of the calibration frame.
 /// The calibration frame displays all palette colors in known grid positions.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn calibrate_from_image(
     img: &RgbImage,
     palette: &[PaletteEntry],
@@ -19,7 +22,6 @@ pub fn calibrate_from_image(
         let col = idx % grid_cols;
         let row = idx / grid_cols;
 
-        // Sample a small patch around the expected cell position
         let sx = (col as f32 / grid_cols as f32) * img.width() as f32;
         let sy = (row as f32 / grid_rows as f32) * img.height() as f32;
         let cell_w = img.width() as f32 / grid_cols as f32;

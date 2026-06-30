@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>air-transfer — optical data transfer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #111;
+            color: #e0e0e0;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        h1 { font-size: 1.4rem; margin-bottom: 8px; color: #00ff88; }
+        .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 24px; }
+        .container {
+            display: flex; gap: 24px; flex-wrap: wrap; justify-content: center; width: 100%; max-width: 1100px;
+        }
+        .panel {
+            background: #1a1a1a; border: 1px solid #333; border-radius: 10px; padding: 20px;
+            flex: 1; min-width: 320px; max-width: 520px;
+        }
+        .panel h2 { font-size: 1rem; margin-bottom: 12px; color: #00ff88; }
+        label { display: block; margin: 10px 0 4px; font-size: 0.8rem; color: #aaa; }
+        button, .btn {
+            background: #00ff88; color: #111; border: none; border-radius: 6px;
+            padding: 10px 20px; font-family: inherit; font-size: 0.9rem; cursor: pointer;
+            font-weight: 600; margin-top: 12px;
+        }
+        button:hover { background: #00cc66; }
+        button:disabled { background: #555; color: #888; cursor: not-allowed; }
+        canvas {
+            display: block; margin: 12px auto; border: 1px solid #333; border-radius: 6px;
+            image-rendering: pixelated; max-width: 100%;
+        }
+        video { display: none; }
+        .progress-bar {
+            width: 100%; height: 6px; background: #333; border-radius: 3px; margin: 8px 0; overflow: hidden;
+        }
+        .progress-fill { height: 100%; background: #00ff88; transition: width 0.2s; }
+        .status { font-size: 0.8rem; color: #aaa; margin: 4px 0; }
+        .status.error { color: #ff4444; }
+        .status.success { color: #00ff88; }
+        .info-row { display: flex; gap: 12px; font-size: 0.8rem; }
+        .info-row span { color: #00ff88; }
+        .file-input-wrapper { margin-top: 10px; }
+        input[type="file"] { display: none; }
+        .file-label {
+            display: inline-block; background: #333; color: #e0e0e0; border: 1px solid #555;
+            border-radius: 6px; padding: 8px 14px; font-size: 0.85rem; cursor: pointer;
+        }
+        .file-label:hover { background: #444; }
+        .file-name { margin-left: 10px; font-size: 0.8rem; color: #aaa; }
+    </style>
+</head>
+<body>
+    <h1>air-transfer</h1>
+    <p class="subtitle">optical data transfer via screen pixels & camera</p>
+
+    <div class="container">
+        <!-- SEND PANEL -->
+        <div class="panel" id="send-panel">
+            <h2>&#8593; Send</h2>
+            <div class="file-input-wrapper">
+                <label for="file-input" class="file-label">Choose file</label>
+                <input type="file" id="file-input" />
+                <span class="file-name" id="file-name">no file selected</span>
+            </div>
+            <div class="info-row">
+                <span id="send-shards">shards: -</span>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="send-progress-fill"></div></div>
+            <div class="status" id="send-status"></div>
+            <canvas id="send-canvas" width="720" height="720"></canvas>
+            <button id="send-prepare-btn" disabled>Prepare</button>
+        </div>
+
+        <!-- RECEIVE PANEL -->
+        <div class="panel" id="recv-panel">
+            <h2>&#8595; Receive</h2>
+            <video id="camera-video" autoplay playsinline></video>
+            <canvas id="process-canvas" width="640" height="480" style="display: none;"></canvas>
+            <div class="info-row">
+                <span id="recv-shards">shards: -</span>
+            </div>
+            <div class="progress-bar"><div class="progress-fill" id="recv-progress-fill"></div></div>
+            <div class="status" id="recv-status"></div>
+            <canvas id="ack-canvas" width="720" height="720"></canvas>
+            <button id="start-receive-btn">Start Camera</button>
+            <button id="download-btn" disabled>Download received file</button>
+        </div>
+    </div>
+
+    <!-- Trunk module loading -->
+    <script type="module">
+        import init from './pkg/air_transfer.js';
+
+        async function run() {
+            await init();
+            try {
+                // The wasm_bindgen(start) auto-inits, we just trigger our app
+                const { WebApp } = window.__air_transfer || {};
+                // Fallback: access via global
+                if (window.__wasm) {
+                    const wasm = window.__wasm;
+                    if (wasm.WebApp) {
+                        window.app = wasm.WebApp.new();
+                    }
+                }
+            } catch (e) {
+                console.error("init error:", e);
+            }
+        }
+
+        // Store for access from JS
+        window.__wasm_init = run;
+        run();
+    </script>
+    <script>
+        // ---- BRIDGE: Rust WebApp exposed via wasm-bindgen ----
+        // We'll use a polling approach since the Rust struct is exposed.
+
+        let app = null;
+        let sendTimer = null;
+        let recvTimer = null;
+        let cameraStream = null;
+
+        const sendCanvas = document.getElementById('send-canvas');
+        const ackCanvas = document.getElementById('ack-canvas');
+        const processCanvas = document.getElementById('process-canvas');
+        const procCtx = processCanvas.getContext('2d');
+        const cameraVideo = document.getElementById('camera-video');
+
+        // File input
+        const fileInput = document.getElementById('file-input');
+        const fileName = document.getElementById('file-name');
+        const prepareBtn = document.getElementById('send-prepare-btn');
+
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length > 0) {
+                fileName.textContent = fileInput.files[0].name;
+                prepareBtn.disabled = false;
+            }
+        });
+
+        // Wait for wasm then instantiate
+        async function ensureApp() {
+            if (app) return app;
+            // wasm-bindgen exports go to the default module
+            const mod = await import('./pkg/air_transfer.js');
+            await mod.default();
+            app = new mod.WebApp();
+            return app;
+        }
+
+        // --- SEND ---
+        prepareBtn.addEventListener('click', async () => {
+            const app = await ensureApp();
+            const file = fileInput.files[0];
+            if (!file) return;
+
+            const status = document.getElementById('send-status');
+            status.textContent = 'encoding...';
+            status.className = 'status';
+
+            const buffer = await file.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+            const shardCount = app.prepare_send(bytes);
+
+            document.getElementById('send-shards').textContent = `shards: 0 / ${shardCount}`;
+            status.textContent = `ready — ${shardCount} frames`;
+            status.className = 'status success';
+
+            sendTimer = setInterval(() => {
+                if (!app.send_done() && app.render_send_frame(sendCanvas)) {
+                    const cur = app.send_current();
+                    const tot = app.send_total();
+                    document.getElementById('send-shards').textContent = `shards: ${cur} / ${tot}`;
+                    document.getElementById('send-progress-fill').style.width = `${tot > 0 ? (cur / tot) * 100 : 0}%`;
+                } else {
+                    clearInterval(sendTimer);
+                    status.textContent = 'done';
+                }
+            }, 200);
+        });
+
+        // --- RECEIVE ---
+        document.getElementById('start-receive-btn').addEventListener('click', async () => {
+            const app = await ensureApp();
+            app.init_receive();
+
+            // Start camera
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, facingMode: 'environment' }
+                });
+                cameraVideo.srcObject = cameraStream;
+                await cameraVideo.play();
+            } catch (e) {
+                document.getElementById('recv-status').textContent = `camera error: ${e.message}`;
+                document.getElementById('recv-status').className = 'status error';
+                return;
+            }
+
+            document.getElementById('recv-status').textContent = 'capturing...';
+            document.getElementById('recv-status').className = 'status';
+
+            // Render handshake on ACK canvas
+            const handshake = app.get_handshake_grid();
+            renderGridToCanvas(ackCanvas, handshake);
+
+            // Capture + decode loop
+            recvTimer = setInterval(() => {
+                if (app.recv_done()) {
+                    clearInterval(recvTimer);
+                    document.getElementById('recv-status').textContent = 'transfer complete!';
+                    document.getElementById('recv-status').className = 'status success';
+                    document.getElementById('download-btn').disabled = false;
+                    return;
+                }
+
+                // Draw video frame to processing canvas
+                procCtx.drawImage(cameraVideo, 0, 0, 640, 480);
+                const imgData = procCtx.getImageData(0, 0, 640, 480);
+
+                const info = app.process_camera_frame(imgData);
+                if (info) {
+                    if (info.ack_needed) {
+                        const ackGrid = app.get_ack_grid(info.frame_id);
+                        renderGridToCanvas(ackCanvas, ackGrid);
+                    }
+
+                    const progress = app.recv_progress();
+                    if (progress) {
+                        const [cur, tot] = progress;
+                        document.getElementById('recv-shards').textContent = `shards: ${cur} / ${tot}`;
+                        document.getElementById('recv-progress-fill').style.width = `${(cur / tot) * 100}%`;
+                    }
+                }
+            }, 150);
+        });
+
+        document.getElementById('download-btn').addEventListener('click', async () => {
+            const app = await ensureApp();
+            const data = app.get_received_data();
+            if (!data) return;
+
+            const blob = new Blob([data], { type: 'application/octet-stream' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'received.bin';
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        // Helper: render grid bytes to canvas
+        function renderGridToCanvas(canvas, grid) {
+            const ctx = canvas.getContext('2d');
+            const cellSize = 12;
+            const cols = 50;
+            const rows = 50;
+            const margin = 5 * cellSize;
+            canvas.width = canvas.height = 60 * cellSize;
+
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Green border
+            ctx.fillStyle = '#00ff00';
+            const b = 2 * cellSize;
+            ctx.fillRect(b, b, canvas.width - 2*b, 2*cellSize);
+            ctx.fillRect(b, b, 2*cellSize, canvas.height - 2*b);
+            ctx.fillRect(canvas.width - b - 2*cellSize, b, 2*cellSize, canvas.height - 2*b);
+            ctx.fillRect(b, canvas.height - b - 2*cellSize, canvas.width - 2*b, 2*cellSize);
+
+            // Grid
+            const offset = margin + 2 * cellSize; // margin + corners
+            for (let row = 0; row < rows; row++) {
+                for (let col = 0; col < cols; col++) {
+                    const idx = row * cols + col;
+                    if (idx >= grid.length) continue;
+                    const bv = grid[idx];
+                    const r = ((bv >> 4) & 3) * 85;
+                    const g = ((bv >> 2) & 3) * 85;
+                    const b = (bv & 3) * 85;
+                    ctx.fillStyle = `rgb(${r},${g},${b})`;
+                    ctx.fillRect(offset + col * cellSize, offset + row * cellSize, cellSize, cellSize);
+                }
+            }
+        }
+    </script>
+</body>
+</html>

@@ -1,6 +1,5 @@
-use crate::color::PaletteEntry;
 use crate::encoder::unpack_indices_to_bytes;
-use crate::protocol::{FrameHeader, FrameType, GRID_COLS, GRID_ROWS, HEADER_ROWS};
+use crate::protocol::{FrameHeader, FrameType, HEADER_ROWS};
 
 #[derive(Debug)]
 pub struct DecodedFrame {

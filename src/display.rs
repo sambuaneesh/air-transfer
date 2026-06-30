@@ -1,6 +1,7 @@
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use winit::window::{Fullscreen, Window, WindowAttributes};
 
+pub use crate::encoder::palette_index_to_rgb;
 use crate::error::Result;
 
 const GRID_CELLS: u32 = 52;
@@ -180,9 +181,4 @@ pub fn render_grid(
     }
 }
 
-pub fn palette_index_to_rgb(idx: u8) -> (u8, u8, u8) {
-    let r = ((idx >> 4) & 0x03) * 85;
-    let g = ((idx >> 2) & 0x03) * 85;
-    let b = (idx & 0x03) * 85;
-    (r, g, b)
-}
+

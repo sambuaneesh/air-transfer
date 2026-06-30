@@ -3,17 +3,75 @@ name = "air-transfer"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "air-transfer"
+path = "src/main.rs"
+
 [dependencies]
-nokhwa = { version = "0.10.11", features = ["input-v4l", "input-avfoundation", "input-msmf"] }
-pixels = "0.15"
-winit = "0.30"
+# Core (shared across native + wasm)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 reed-solomon-erasure = "6.0"
 zstd = "0.13"
 postcard = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-clap = { version = "4.5", features = ["derive"] }
 thiserror = "2.0"
 log = "0.4"
-env_logger = "0.11"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+nokhwa = { version = "0.10.11", features = ["input-v4l", "input-avfoundation", "input-msmf"] }
+pixels = "0.15"
+winit = "0.30"
+clap = { version = "4.5", features = ["derive"] }
+env_logger = "0.11"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "CanvasRenderingContext2d",
+    "HtmlCanvasElement",
+    "HtmlVideoElement",
+    "HtmlInputElement",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "ImageData",
+    "MediaStream",
+    "MediaStreamConstraints",
+    "MediaStreamTrack",
+    "MediaDevices",
+    "Navigator",
+    "Window",
+    "Document",
+    "Element",
+    "Event",
+    "EventTarget",
+    "File",
+    "FileList",
+    "FileReader",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
+    "Response",
+    "Request",
+    "RequestInit",
+    "Headers",
+    "console",
+    "DomRect",
+    "DomException",
+    "MediaTrackConstraints",
+    "MediaTrackSupportedConstraints",
+    "VideoTrack",
+    "VideoTrackList",
+    "MessageEvent",
+] }
+js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+gloo-timers = { version = "0.3", features = ["futures"] }
+gloo-file = "0.3"
+gloo-dialogs = "0.2"
+gloo-utils = { version = "0.2", features = ["serde"] }
+serde-wasm-bindgen = "0.6"

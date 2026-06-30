@@ -3,7 +3,7 @@ use nokhwa::{
     Camera,
     pixel_format::RgbFormat,
     query,
-    utils::{CameraIndex, CameraFormat, FrameFormat, RequestedFormat, Resolution},
+    utils::{CameraIndex, FrameFormat, RequestedFormat, Resolution},
 };
 use std::time::Duration;
 

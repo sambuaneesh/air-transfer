@@ -1,8 +1,6 @@
 use image::RgbImage;
 
-use crate::color::{Hsv, PaletteEntry, classify_cell, rgb_to_hsv};
-use crate::error::Result;
-use crate::protocol::{GRID_COLS, GRID_ROWS};
+use crate::color::{PaletteEntry, classify_cell, rgb_to_hsv};
 
 /// A detected quadrilateral in the image
 #[derive(Debug, Clone)]

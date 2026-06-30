@@ -1,7 +1,6 @@
 use crate::color::PaletteEntry;
-use crate::display::palette_index_to_rgb;
 use crate::protocol::{
-    CELL_BITS, DataShard, FrameHeader, FrameType, GRID_COLS, GRID_ROWS, HEADER_ROWS,
+    FrameHeader, FrameType, GRID_COLS, GRID_ROWS, HEADER_ROWS,
     REF_CELL_INTERVAL,
 };
 
@@ -94,6 +93,14 @@ pub fn build_grid(
     }
 
     grid
+}
+
+/// Convert a 6-bit palette index (2 bits per channel) to RGB
+pub fn palette_index_to_rgb(idx: u8) -> (u8, u8, u8) {
+    let r = ((idx >> 4) & 0x03) * 85;
+    let g = ((idx >> 2) & 0x03) * 85;
+    let b = (idx & 0x03) * 85;
+    (r, g, b)
 }
 
 /// Render grid to RGBA buffer for display

@@ -2,6 +2,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Error {
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("camera error: {0}")]
     Camera(#[from] nokhwa::NokhwaError),
 
@@ -31,6 +32,10 @@ pub enum Error {
 
     #[error("detection error: {0}")]
     Detection(String),
+
+    #[cfg(target_arch = "wasm32")]
+    #[error("camera error: {0}")]
+    Camera(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
