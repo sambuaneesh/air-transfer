@@ -1,210 +1,241 @@
 # air-transfer
 
-**Optical air-gapped data transfer via screen pixels & camera.**
+**Optical, air-gapped data transfer via display pixels and camera.**
 
-Transfer files between two computers using just their screens and built-in webcams — no WiFi, Bluetooth, USB, or any network required. Think "QR codes on steroids": high-density colored 2D grids with a full bidirectional protocol (ACK/retransmit) for reliable transfer of files up to ~1 MB.
-
-- **Two laptops, screens facing each other's cameras**
-- **Full-duplex visual protocol**: one screen shows data frames, the other's camera reads them and responds with visual ACK frames
-- **~20 KB/s throughput** (50×50 grid, 64 colors, 2 bits/channel, ~10 fps effective)
-- **Reed-Solomon error correction** + zstd compression
-- **Rust native binary** + **WASM web app** (browser-based, no install)
-
-```
-┌──────────────┐   camera → reads ACK   ┌──────────────┐
-│   SENDER     │ ═══════════════════════ │   RECEIVER   │
-│              │ ← screen shows data    │              │
-│  file.zip →  │   frames               │  camera →    │
-│  compress →  │                        │  detect →    │
-│  ECC → grid  │ screen → shows ACK ←   │  decode →    │
-│  → display   │ ═══════════════════════ │  → file.zip  │
-└──────────────┘                        └──────────────┘
-```
+Two laptops face screen-to-camera. Data is encoded as high-density colored 2D grids, displayed on one screen, captured by the other's camera, acknowledged visually, and reassembled — no wires, no WiFi, no Bluetooth.
 
 ---
 
-## Quick Start
+## How it works
 
-### Native (Desktop)
+1. **Compress** — input file is compressed with Zstandard
+2. **ECC encode** — split into shards with Reed-Solomon error correction (16 data + 8 parity)
+3. **Encode to grid** — each shard becomes a 50×50 grid of colored cells (64 colors, 6 bits/cell)
+4. **Display** — grid rendered fullscreen with green registration border + corner markers
+5. **Capture** — receiver's camera detects the green border, rectifies perspective via homography
+6. **Decode** — color classification in HSV space, cell extraction, shard reassembly
+7. **ACK** — receiver displays a tiny ACK frame on its own screen, sender captures it
+8. **Reconstruct** — ECC corrects errors, data decompressed, output written to disk
+
+---
+
+## Installation
+
+### Native build
 
 ```bash
-# Prerequisites: Rust 1.80+, build-essential/Xcode CLT, v4l2 (Linux)
+# Prerequisites
+# Linux:   sudo apt install build-essential pkg-config libv4l-dev
+# macOS:   xcode-select --install
+# Windows: install Visual Studio Build Tools
 
-# Clone and build
-git clone <repo-url> && cd air-transfer
+git clone https://github.com/user/air-transfer.git
+cd air-transfer
 cargo build --release
-
-# Test the display (opens fullscreen grid — Esc to exit)
-cargo run --release -- --mode test-display
-
-# Send a file
-cargo run --release -- --mode send --input data.zip
-
-# Receive a file (on the other laptop)
-cargo run --release -- --mode receive --output data.zip
 ```
 
-### Web (Browser)
+### Web build (WASM)
 
 ```bash
-# Prerequisites: trunk (cargo install trunk), wasm32 target
-rustup target add wasm32-unknown-unknown
+# Install Trunk
 cargo install trunk
 
-# Start dev server
-trunk serve
+# Install WASM target
+rustup target add wasm32-unknown-unknown
 
-# Open http://localhost:8080 on both laptops
-# One chooses "Send", the other "Receive"
-# Face screens toward each other's cameras
+# Build and serve
+trunk serve
+# Opens at http://localhost:8080
 ```
 
 ---
 
-## CLI Parameters (Native)
+## Usage — Native CLI
+
+```bash
+# Show help
+cargo run -- --help
+```
+
+### Send a file
+
+```bash
+cargo run -- --mode send --input document.zip
+```
+
+The sender opens a fullscreen window, encodes the file into colored grid frames, and displays them sequentially. Position your screen facing the receiver's camera.
+
+### Receive a file
+
+```bash
+cargo run -- --mode receive --output received.zip
+```
+
+The receiver opens a fullscreen window displaying a handshake grid. It uses the built-in camera to capture the sender's screen, detects and decodes frames, and writes the output file.
+
+### Test the display
+
+```bash
+cargo run -- --mode test-display
+```
+
+Opens a fullscreen window showing a handshake grid so you can verify the display output looks correct.
+
+### Full CLI reference
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-m, --mode` | `send` | Operating mode: `send`, `receive`, or `test-display` |
-| `-i, --input` | (required for send) | Path to file to transmit |
+| `-m, --mode` | `send` | `send`, `receive`, or `test-display` |
+| `-i, --input` | — | Path to file to send (required for send mode) |
 | `-o, --output` | `received_output.bin` | Path for received file (receive mode) |
-| `--camera` | `0` | Camera device index (0 = built-in webcam) |
-| `--cam-width` | `640` | Requested camera capture width |
-| `--cam-height` | `480` | Requested camera capture height |
-| `--no-fullscreen` | (flag) | Open in windowed instead of fullscreen |
+| `--camera` | `0` | Camera device index (receive mode / ACK detection) |
+| `--cam-width` | `640` | Camera capture width |
+| `--cam-height` | `480` | Camera capture height |
+| `--no-fullscreen` | false | Disable fullscreen (windowed mode for debugging) |
 
----
+### Scenarios
 
-## Usage Scenarios
-
-### Scenario 1: Two Laptops, Face-to-Face
-
-1. **Laptop A (Sender):** `cargo run --release -- --mode send --input project.zip`
-2. **Laptop B (Receiver):** `cargo run --release -- --mode receive --output project.zip`
-3. Align screens so each camera sees the other's full display. Transfer begins automatically.
-
-### Scenario 2: Web Browser Transfer (No Rust Install)
-
-1. `trunk serve` on one machine (or deploy to static host)
-2. Open `http://<host>:8080` on both laptops
-3. Sender: click **Choose file** → **Prepare**
-4. Receiver: click **Start Camera** (grants camera permission)
-5. Face screens toward each other's cameras
-
-### Scenario 3: Test Without Two Machines
+**Scenario A: Two laptops, same room**
 
 ```bash
-cargo run --release -- --mode test-display
-```
-Opens a fullscreen window with the handshake grid. Press Escape to exit.
+# Laptop A (sender)
+cargo run -- --mode send --input secrets.zip
 
-### Scenario 4: Windowed Mode for Debugging
-
-```bash
-cargo run --release -- --mode send --input data.zip --no-fullscreen --cam-width 320 --cam-height 240
+# Laptop B (receiver)
+cargo run -- --mode receive --output secrets.zip
 ```
 
-### Scenario 5: External Webcam
+1. Position laptops so their screens face each other's cameras
+2. Align for best camera view of the other screen
+3. Both laptops will detect each other and begin transfer automatically
+4. Sender advances frames as ACKs are received
+5. Press Escape on either side to cancel
+
+**Scenario B: Send-only display (no ACK)**
+
+If the receiver doesn't have the app, the sender can still display frames on a timer (500ms per frame). The receiver could use a phone camera to record, then process later.
 
 ```bash
-cargo run --release -- --mode receive --camera 1 --cam-width 1280 --cam-height 720
+cargo run -- --mode send --input data.zip
+```
+
+**Scenario C: Quick display test**
+
+```bash
+cargo run -- --mode test-display --no-fullscreen
 ```
 
 ---
 
-## How It Works
+## Usage — Web Application
 
-### Frame Structure
+```bash
+trunk serve
+```
 
-Each frame is a grid of colored cells surrounded by a green registration border with distinct corner markers for orientation detection:
+Opens the browser-based UI at `http://localhost:8080`.
 
-- **Quiet zone**: 2-cell black border
-- **Registration border**: 2-cell solid green (#00ff00)
-- **Corner markers**: 2×2 distinct color blocks (R/B, G/W, Y/C, M/K)
-- **Header**: 2 rows, 1-bit/channel (8 colors) for robust decoding — contains frame_id, type, shard info, CRC
-- **Payload**: 50 × 50 cells, 2 bits per RGB channel = 64 colors, 6 bits per cell = ~1,875 bytes per frame
-- **Reference cells**: Every 8th row/col contains known palette colors for per-frame calibration
+### Send tab
+1. Choose a file
+2. Click **Prepare** — file is compressed, ECC-encoded, split into grid frames
+3. The send canvas displays frames in sequence
+4. Face your screen toward the receiver's camera
 
-### Protocol
+### Receive tab
+1. Click **Start Camera** — browser requests camera permission
+2. The camera captures the sender's screen
+3. Detected frames are decoded, shards collected
+4. When complete, click **Download received file** to save
 
-**Stop-and-wait with visual ACK:**
+### Web app layout
 
-1. **Handshake**: Both sides display a known "ready" pattern; cameras detect each other
-2. **Data frames**: Sender encodes file into Reed-Solomon shards, displays them sequentially
-3. **ACK frames**: Receiver decodes each frame, displays a tiny ACK grid on its screen
-4. **Sender's camera** detects the ACK and advances to the next frame
-5. **Timeout + retransmit** if ACK not detected within ~500ms
-6. **Assembly**: Receiver collects all shards → ECC decode → zstd decompress → output file
-
-### Encoding Pipeline
-
-- **Compression**: zstd level 3
-- **ECC**: Reed-Solomon GF(2⁸), 8 parity shards per 16 data shards (tolerates up to 8 lost shards)
-- **Color**: 64-color palette (2 bits per RGB channel = 6 bits/cell)
-- **Header**: Frame ID (u16), type (2 bits), shard count/index, data length, checksum
-
-### Detection Pipeline (Receiver)
-
-1. Green border thresholded in HSV → binary mask
-2. Contour detection → quadrilateral → 4 corner points
-3. Homography (perspective transform) via DLT
-4. Cell centers sampled through homography with bilinear interpolation
-5. Color classification: nearest-neighbor in HSV space against calibrated palette
-6. Header decoded from first 2 grid rows
-7. Payload cells unpacked into bytes
+```
+┌─────────────┐  ┌───────────────┐
+│   ↑ SEND    │  │   ↓ RECEIVE   │
+│             │  │               │
+│ file picker │  │ [Start Cam]   │
+│ [Prepare]   │  │               │
+│             │  │ progress bar  │
+│ progress    │  │               │
+│   bar       │  │ ACK canvas    │
+│             │  │               │
+│ grid canvas │  │ [Download]    │
+└─────────────┘  └───────────────┘
+```
 
 ---
 
-## Project Structure
+## Protocol details
+
+| Property | Value |
+|----------|-------|
+| Grid size | 52×52 cells (50×50 payload + 2 header rows + borders) |
+| Bits per cell | 6 (2 bits per RGB channel, 64 colors) |
+| Payload per frame | ~2,000 bytes |
+| Header | 2 rows, frame ID + type + ECC params + checksum |
+| Color space | HSV classification with Euclidean nearest-neighbor |
+| Registration | Green border + 4 distinct corner marker patterns |
+| Rectification | 8-DOF perspective homography via DLT |
+| Error correction | Reed-Solomon GF(2⁸), 16 data + 8 parity shards |
+| Compression | Zstandard (level 3) |
+| ACK frame | Tiny 8×8 equivalent, 1 bit/channel, robust |
+| Protocol | Stop-and-wait with frame ID sequencing |
+
+### Performance
+
+For a 1 MB file on two laptops screen-to-camera:
+- **Compression**: ~700 KB (depends on file type)
+- **Shards**: ~350 frames
+- **At 5-10 fps effective**: 35-70 seconds
+- **ACK overhead**: negligible (ACK frame is tiny and decoded in <1 frame)
+
+---
+
+## Architecture
 
 ```
 src/
-├── lib.rs            # Library root — shared modules
-├── main.rs           # Binary entry (calls native module)
-├── native.rs         # Native-only CLI + winit/pixels app logic
-├── web_app.rs        # WASM-only browser UI (Canvas + getUserMedia)
-├── display.rs        # Native display (pixels + winit, GPU rendering)
-├── camera.rs         # Native camera (nokhwa)
-├── encoder.rs        # Data → grid cells (palette + layout)
-├── decoder.rs        # Grid cells → data (classification + extraction)
-├── protocol.rs       # Frame types, serde structs, constants
-├── correction.rs     # Reed-Solomon ECC encode/decode
-├── detection.rs      # Border detection, homography, cell sampling
-├── color.rs          # RGB↔HSV, palette, cell classifier
-├── calibration.rs    # Palette measurement from calibration frame
-└── error.rs          # Error types (thiserror)
+├── main.rs         # Entry point (dispatches native or WASM)
+├── lib.rs          # Shared module declarations
+├── native.rs       # Native CLI app (winit + pixels + nokhwa)
+├── web_app.rs      # WASM browser app (canvas + getUserMedia)
+├── protocol.rs     # Frame types, headers, serde
+├── encoder.rs      # Data → grid encoding, palette index conversion
+├── decoder.rs      # Grid → data decoding
+├── color.rs        # HSV conversion, classification, palettes
+├── detection.rs    # Border detection, homography, cell sampling
+├── correction.rs   # Reed-Solomon ECC wrapper
+├── calibration.rs  # Palette calibration from captured frames
+├── display.rs      # Native fullscreen pixel grid renderer
+├── camera.rs       # Native nokhwa camera capture
+└── error.rs        # Error types
 ```
 
----
+### Shared core (works on native + WASM)
+`protocol`, `encoder`, `decoder`, `color`, `detection`, `correction`, `calibration`, `error`
 
-## Build Targets
+### Native only
+`native.rs` → `display.rs` + `camera.rs` (winit/pixels/nokhwa)
 
-| Target | Command | Output |
-|--------|---------|--------|
-| Native debug | `cargo build` | `target/debug/air-transfer` |
-| Native release | `cargo build --release` | `target/release/air-transfer` |
-| WASM (check) | `cargo check --target wasm32-unknown-unknown` | type-check |
-| WASM (serve) | `trunk serve` | Browser at localhost:8080 |
-| WASM (dist) | `trunk build --release` | `dist/` for static hosting |
-
-**Linux**: `sudo usermod -aG video $USER` may be needed for camera access (log out/in after).
-**macOS**: First camera access triggers a system permission dialog.
+### WASM only
+`web_app.rs` → canvas 2D rendering + getUserMedia camera
 
 ---
 
-## Limitations & Future
+## Dependencies
 
-- **Max file**: ~1 MB (larger files time out or exceed practical shard count)
-- **Lighting**: Works best with consistent indoor lighting; avoid direct sunlight on screens
-- **Camera quality**: Built-in 720p webcams work; higher-res cameras improve reliability
-- **Alignment**: Screens should face each other directly; significant tilt reduces detection
-
-### Planned
-- Adaptive bits-per-channel based on measured error rate
-- Multi-frame pipelining for higher throughput
-- External camera optimization (higher resolution → denser grids)
-- Mobile support via web app (phone camera + screen)
-- Audio out-of-band ACK (beep detection) for faster turnaround
+| Crate | Purpose | Platform |
+|-------|---------|----------|
+| `image` | Image buffer types | All |
+| `reed-solomon-erasure` | ECC | All |
+| `zstd` | Compression | All |
+| `postcard` + `serde` | Serialization | All |
+| `xxhash-rust` | Checksums | All |
+| `winit` + `pixels` | Display rendering | Native only |
+| `nokhwa` | Camera capture | Native only |
+| `clap` | CLI parsing | Native only |
+| `wasm-bindgen` + `web-sys` | Browser API bindings | WASM only |
+| `trunk` | WASM bundler/dev server | WASM only |
 
 ---
 

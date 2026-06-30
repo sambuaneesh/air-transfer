@@ -235,12 +235,10 @@
                         renderGridToCanvas(ackCanvas, ackGrid);
                     }
 
-                    const progress = app.recv_progress();
-                    if (progress) {
-                        const [cur, tot] = progress;
-                        document.getElementById('recv-shards').textContent = `shards: ${cur} / ${tot}`;
-                        document.getElementById('recv-progress-fill').style.width = `${(cur / tot) * 100}%`;
-                    }
+                    const cur = app.recv_received();
+                    const tot = app.recv_total();
+                    document.getElementById('recv-shards').textContent = `shards: ${cur} / ${tot}`;
+                    document.getElementById('recv-progress-fill').style.width = `${tot > 0 ? (cur / tot) * 100 : 0}%`;
                 }
             }, 150);
         });
